@@ -2,7 +2,7 @@
 a beautiful kexploit.
 
 ## support
-Currently supports ios 18.0 - 18.3.1.
+Currently tested on iOS 18.0 - 18.3.1.
 If you run lara on your device, and it ends up working, please contact me on [discord](https://discord.com/users/919268666305024010) and tell me:
 1. your device
 2. your iOS version
