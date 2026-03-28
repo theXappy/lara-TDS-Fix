@@ -280,7 +280,7 @@ struct LogsView: View {
     @ObservedObject var logger: Logger
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             List {
                 ForEach(Array(logger.logs.enumerated()), id: \.offset) { _, log in
                     Text(log)

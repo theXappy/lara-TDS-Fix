@@ -106,6 +106,10 @@ struct ContentView: View {
                                 FontPicker(mgr: mgr)
                             }
                             
+                            NavigationLink("DirtyZero ?") {
+                                ZeroView(mgr: mgr)
+                            }
+                            
                             if 1 == 2 {
                                 NavigationLink("3 App Bypass") {
                                     AppsView(mgr: mgr)
@@ -227,6 +231,35 @@ struct ContentView: View {
                     }
                     .onTapGesture {
                         if let url = URL(string: "https://github.com/AppInstalleriOSGH"),
+                           UIApplication.shared.canOpenURL(url) {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                    
+                    HStack(alignment: .top) {
+                        AsyncImage(url: URL(string: "https://github.com/jailbreakdotparty.png")) { image in
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } placeholder: {
+                            ProgressView()
+                        }
+                        .frame(width: 40, height: 40)
+                        .clipShape(Circle())
+                        
+                        VStack(alignment: .leading) {
+                            Text("jailbreak.party")
+                                .font(.headline)
+                            
+                            Text("All of the DirtyZero tweaks and emotional support.")
+                                .font(.subheadline)
+                                .foregroundColor(Color.secondary)
+                        }
+                        
+                        Spacer()
+                    }
+                    .onTapGesture {
+                        if let url = URL(string: "https://github.com/jailbreakdotparty"),
                            UIApplication.shared.canOpenURL(url) {
                             UIApplication.shared.open(url)
                         }
