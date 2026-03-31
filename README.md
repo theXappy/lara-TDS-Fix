@@ -7,7 +7,6 @@ If you run lara on your device, and it ends up working, please contact me on [di
 1. your device
 2. your iOS version
 4. what you tested in lara (eg. Run Exploit, Init KFS, etc.)
-5. your logs
 
 If lara doesnt work on your device, and you want to help the project, please also provide your logs and iOS version.
 
