@@ -15,11 +15,12 @@ If lara doesnt work on your device, and you want to help the project, please als
 ## features:
 ### implemented:
 - Font Overwrite
+- 3 App Bypass
+- File Manager (Full Disk r/w)
 - DirtyZero 2 (Broken)
 
 ### coming soon:
-- MobileGestalt Editor?
-- File Manager (Full Disk r/w)
+- MobileGestalt Editor
 
 ## known issues:
 - on iOS 17.x, the kernel panics when lara is closed from the app switcher. this may or may not be fixed soon?
