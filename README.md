@@ -3,6 +3,8 @@
   <a href="https://discord.gg/gw8PcRF3Jr"><img src="https://github.com/rooootdev/lara/blob/main/lara.png?raw=true" alt="JESSI Logo" width="200"></a>
   <br>
   <h1>LARA</h1>
+
+  <p>star this repo please :P</p>
 </div>
 
 <p align="center">
@@ -25,7 +27,6 @@
   <a href="#features">features</a> •
   <a href="#installation">installation</a>
 </p>
-> star this repo please :P
 
 ## support
 lara will at its absolute best only ever support versions up to iOS 26.0.1/iOS 18.7.1. the exploit was patched after those versions.
