@@ -14,7 +14,7 @@ struct CustomView: View {
     @State private var showImporter = false
     @State private var sourcePath: String = ""
     @State private var sourceName: String = "No file selected"
-    @State private var isOverwriting = false
+    @State private var isoverwriting = false
 
     var body: some View {
         List {
@@ -36,8 +36,8 @@ struct CustomView: View {
                     showImporter = true
                 }
 
-                Button(isOverwriting ? "Overwriting..." : "Overwrite Target") {
-                    guard !isOverwriting else { return }
+                Button(isoverwriting ? "Overwriting..." : "Overwrite Target") {
+                    guard !isoverwriting else { return }
                     overwrite()
                 }
                 .disabled(!canOverwrite)
@@ -65,7 +65,7 @@ struct CustomView: View {
     }
 
     private var canOverwrite: Bool {
-        mgr.vfsready && !targetPath.isEmpty && !sourcePath.isEmpty && !isOverwriting
+        mgr.vfsready && !targetPath.isEmpty && !sourcePath.isEmpty && !isoverwriting
     }
 
     private func importSource(_ url: URL) {
@@ -88,11 +88,11 @@ struct CustomView: View {
 
     private func overwrite() {
         guard canOverwrite else { return }
-        isOverwriting = true
+        isoverwriting = true
         DispatchQueue.global(qos: .userInitiated).async {
             let ok = mgr.vfsoverwritefromlocalpath(target: targetPath, source: sourcePath)
             DispatchQueue.main.async {
-                isOverwriting = false
+                isoverwriting = false
                 ok ? mgr.logmsg("overwrite ok: \(targetPath)") : mgr.logmsg("overwrite failed: \(targetPath)")
             }
         }

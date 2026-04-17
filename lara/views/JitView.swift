@@ -16,36 +16,52 @@ struct proc: Identifiable {
 }
 
 struct JitView: View {
+    @ObservedObject private var mgr = laramgr.shared
     @State private var query = ""
-    @State private var processes: [proc] = []
-    @State private var issetup = false
-    @State private var showsetup = false
-    @State private var showresetup = false
+    @State private var allProcesses: [proc] = []
+    @State private var enablingBundleID: String? = nil
+
+    private var filteredProcesses: [proc] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return allProcesses }
+
+        let q = trimmed.lowercased()
+        return allProcesses.filter { process in
+            process.name.lowercased().contains(q) || process.bundle.lowercased().contains(q)
+        }
+    }
     
     var body: some View {
         NavigationStack {
             List {
-                if !issetup {
-                    Section("Setup") {
-                        Text("Initial setup is required before listing applications.")
-                        
-                        Button("Run Setup") {
-                            showsetup = true
-                        }
-                    }
-                } else {
-                    HStack {
-                        TextField("Search", text: $query)
-                        
-                        Button {
-                            loadprocs()
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                    }
-                    
+                if !mgr.sbxready {
                     Section {
-                        ForEach(processes) { proc in
+                        Text("Sandbox escape not ready. Run the sandbox escape first.")
+                            .foregroundColor(.secondary)
+                    } header: {
+                        Text("Status")
+                    }
+                }
+
+                HStack {
+                    TextField("Search", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    Button {
+                        loadprocs()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(!mgr.sbxready)
+                }
+
+                Section {
+                    if filteredProcesses.isEmpty {
+                        Text(query.isEmpty ? "No apps found." : "No matches.")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(filteredProcesses) { proc in
                             HStack {
                                 if let icon = proc.icon {
                                     Image(uiImage: icon)
@@ -66,6 +82,19 @@ struct JitView: View {
                                         .font(.caption)
                                         .foregroundColor(.gray)
                                 }
+
+                                Spacer()
+
+                                Button {
+                                    enableJIT(bundleID: proc.bundle)
+                                } label: {
+                                    if enablingBundleID == proc.bundle {
+                                        ProgressView()
+                                    } else {
+                                        Text("Enable")
+                                    }
+                                }
+                                .disabled(enablingBundleID != nil || !mgr.dsready)
                             }
                         }
                     }
@@ -74,134 +103,43 @@ struct JitView: View {
             .navigationTitle("LaraJIT")
         }
         .onAppear {
-            if issetup {
+            if mgr.sbxready {
                 loadprocs()
+            } else {
+                allProcesses.removeAll()
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
-                    showresetup = true
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                }
-            }
-        }
-        .alert("Reset setup?", isPresented: $showresetup) {
-            Button("Cancel", role: .cancel) { }
-            Button("Reset", role: .destructive) {
-                issetup = false
-                processes.removeAll()
-            }
-        } message: {
-            Text("This will reset the setup and require running it again.")
-        }
-        .sheet(isPresented: $showsetup) {
-            NavigationView {
-                List {
-                    Section(header: Text("Step 1")) {
-                        Text("Download the latest .zip file from the link below then extract the contents to a place you like. We will need this later.")
-                        Button("Go to Link") {
-                            UIApplication.shared.open(URL(string: "https://github.com/haxi0/WDBDDISSH/releases")!)
-                        }
-                    }
-                    
-                    Section(header: Text("Step 2")) {
-                        Text("Download the file from the link below. It should appear in Settings. Install it, disconnect your phone from your PC if you haven't yet and then reboot your device.")
-                        Button("Install Profile") {
-                            UIApplication.shared.open(URL(string: "https://roooot.dev/lara/jit/cert.pem")!)
-                        }
-                    }
-                    
-                    Section(header: Text("Step 3")) {
-                        Text("After rebooting, press the button below to replace iPhoneDebug.pem with cert.pem. Make sure you are NOT connected to a PC!")
-                        Button("Replace File") {
-                            replacedebug()
-                        }
-                    }
-                    
-                    Section(header: Text("Step 4")) {
-                        Text("After replacing the file, connect your device to your PC. Run the commands below to mount the image from the first step.")
-                        VStack {
-                            Text("ideviceimagemounter DeveloperDiskImageModified_YourVersionHere.dmg DeveloperDiskImageModified_YourVersionHere.dmg.signature")
-                                .font(.custom("Menlo", size: 15))
-                                .foregroundColor(.white)
-                                .padding()
-                        }
-                        .textSelection(.enabled)
-                        .background(
-                            Color.black
-                                .cornerRadius(5)
-                        )
-                    }
-                    
-                    Section(header: Text("Step 5")) {
-                        Text("Congratulations! If you haven't encountered any errors, you have finished the setup.")
-                        Button("Go to Discord Server") {
-                            UIApplication.shared.open(URL(string: "https://dsc.gg/haxi0sm")!)
-                        }
-                    }
-                }
-                .navigationTitle("Setup")
-                .environment(\.defaultMinListRowHeight, 50)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("Done") {
-                            issetup = true
-                            showsetup = false
-                            loadprocs()
-                        }
-                    }
-                }
+        .onChange(of: mgr.sbxready) { ready in
+            if ready {
+                loadprocs()
+            } else {
+                allProcesses.removeAll()
             }
         }
     }
-    
-    func replacedebug() {
-        guard let certURL = Bundle.main.url(forResource: "cert", withExtension: "pem") else {
+
+    func loadprocs() {
+        guard mgr.sbxready else {
             DispatchQueue.main.async {
-                globallogger.log("cert.pem not found")
+                allProcesses.removeAll()
             }
             return
         }
-        
-        do {
-            let fileData = try Data(contentsOf: certURL)
-            let success = laramgr.shared.vfsoverwritewithdata(
-                target: "/System/Library/Lockdown/iPhoneDebug.pem",
-                data: fileData
-            )
-            
-            DispatchQueue.main.async {
-                if success {
-                    globallogger.log("vfs overwrite success")
-                } else {
-                    globallogger.log("vfs overwrite failed")
-                }
-            }
-        } catch {
-            DispatchQueue.main.async {
-                globallogger.log("failed to read cert.pem")
-            }
-        }
-    }
-        
-    func loadprocs() {
+
         DispatchQueue.global(qos: .userInitiated).async {
             var apps: [proc] = []
             let paths = ["/Applications", "/var/containers/Bundle/Application"]
-            
+
             for path in paths {
                 guard let items = try? FileManager.default.contentsOfDirectory(atPath: path) else { continue }
-                
+
                 for item in items {
                     let itempath = path + "/" + item
                     var isdir: ObjCBool = false
                     if FileManager.default.fileExists(atPath: itempath, isDirectory: &isdir), isdir.boolValue {
-                        
                         if path == "/var/containers/Bundle/Application" {
                             guard let uuiditems = try? FileManager.default.contentsOfDirectory(atPath: itempath) else { continue }
-                            
+
                             for uuidItem in uuiditems {
                                 let appbundlepath = itempath + "/" + uuidItem
                                 if appbundlepath.hasSuffix(".app") {
@@ -216,16 +154,52 @@ struct JitView: View {
                     }
                 }
             }
-            
-            if !query.isEmpty {
-                apps = apps.filter { $0.name.lowercased().contains(query.lowercased()) }
-            }
-            
+
             apps.sort { $0.name.lowercased() < $1.name.lowercased() }
-            
+
             DispatchQueue.main.async {
-                processes = apps
+                allProcesses = apps
             }
+        }
+    }
+
+    private func enableJIT(bundleID: String) {
+        guard enablingBundleID == nil else { return }
+        guard mgr.dsready else {
+	            globallogger.log("kernel r/w not ready")
+	            return
+	        }
+
+	        enablingBundleID = bundleID
+	        globallogger.log("(jit) enabling for \(bundleID)...")
+
+	        let runEnable: () -> Void = {
+	            DispatchQueue.global(qos: .userInitiated).async {
+	                let err: Int32 = bundleID.withCString { cStr in
+	                    enable_jit(cStr)
+	                }
+	                DispatchQueue.main.async {
+	                    if err == 0 {
+	                        globallogger.log("(jit) enabled for \(bundleID)")
+	                    } else {
+	                        globallogger.log("(jit) failed for \(bundleID): \(err)")
+	                    }
+	                    enablingBundleID = nil
+	                }
+	            }
+	        }
+
+	        if mgr.remotecallrunning {
+	            runEnable()
+	        } else {
+	            mgr.rcinit(process: "SpringBoard", migbypass: false) { success in
+	                if success {
+	                    runEnable()
+	                } else {
+	                    globallogger.log("(jit) rcinit failed")
+	                    enablingBundleID = nil
+	                }
+	            }
         }
     }
         

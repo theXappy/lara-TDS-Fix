@@ -152,15 +152,27 @@ struct EditorView: View {
     }
 
     private func apply() {
-        let fm = FileManager.default
         do {
-            try mg.write(to: URL(fileURLWithPath: path))
-            mgr.logmsg("wrote custom mbgestalt to \(path)")
-            alert = "Applied modified mobilegestalt, respring to see changes."
-            return
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: mg,
+                format: .binary,
+                options: 0
+            )
+            
+            let result = laramgr.shared.lara_overwritefile(
+                target: path,
+                data: data
+            )
+            
+            if result.ok {
+                mgr.logmsg("overwrote MobileGestalt at \(path)")
+                alert = "Applied modified mobilegestalt, respring to see changes."
+            } else {
+                status = "overwrite failed: \(result.message)"
+            }
+            
         } catch {
-            status = "failed to write plist: \(error.localizedDescription)"
-            return
+            status = "serialization failed: \(error.localizedDescription)"
         }
     }
     

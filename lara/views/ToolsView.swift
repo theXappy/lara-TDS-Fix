@@ -8,7 +8,7 @@
 import SwiftUI
 
 struct ToolsView: View {
-    private enum TokenClass: String, CaseIterable, Identifiable {
+    private enum tokenclass: String, CaseIterable, Identifiable {
         case read = "com.apple.app-sandbox.read"
         case write = "com.apple.app-sandbox.write"
         case readWrite = "com.apple.app-sandbox.read-write"
@@ -28,8 +28,8 @@ struct ToolsView: View {
     @State private var isaslr: Bool = aslrstate
     @State var showtoken: Bool = false
     @AppStorage("lara.sbx.issuedToken") private var token: String = ""
-    @State private var tokenIssueClass: TokenClass = .readWrite
-    @State private var tokenIssuePath: String = "/"
+    @State private var issueclass: tokenclass = .readWrite
+    @State private var issuepath: String = "/"
     @State private var uid: uid_t = getuid()
     @State private var pid: pid_t = getpid()
     
@@ -77,7 +77,7 @@ struct ToolsView: View {
                 Button {
                     mgr.respring()
                 } label: {
-                    Text("Respring (probably broken)")
+                    Text("Respring")
                 }
                 
                 HStack {
@@ -131,6 +131,17 @@ struct ToolsView: View {
             } header: {
                 Text("Process")
             }
+
+            Section {
+                NavigationLink("LaraJIT") {
+                    JitView()
+                }
+                .disabled(!mgr.dsready)
+            } header: {
+                Text("JIT")
+            } footer: {
+                Text("Enables JIT for an app via RemoteCall (SpringBoard). Requires Kernel R/W.")
+            }
             
             Section {
                 HStack {
@@ -174,8 +185,8 @@ struct ToolsView: View {
                     Text("Class:")
                     Spacer()
 
-                    Picker(" ", selection: $tokenIssueClass) {
-                        ForEach(TokenClass.allCases) { tokenClass in
+                    Picker(" ", selection: $issueclass) {
+                        ForEach(tokenclass.allCases) { tokenClass in
                             Text(tokenClass.label).tag(tokenClass)
                         }
                     }
@@ -186,7 +197,7 @@ struct ToolsView: View {
                     Text("Path:")
                     Spacer()
                     
-                    TextField("/", text: $tokenIssuePath)
+                    TextField("/", text: $issuepath)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .foregroundColor(.secondary)
@@ -197,7 +208,7 @@ struct ToolsView: View {
                 }
 
                 Button {
-                    token = mgr.sbxissuetoken(extClass: tokenIssueClass.rawValue, path: tokenIssuePath) ?? ""
+                    token = mgr.sbxissuetoken(extClass: issueclass.rawValue, path: issuepath) ?? ""
                 } label: {
                     Text("Issue Token")
                 }
