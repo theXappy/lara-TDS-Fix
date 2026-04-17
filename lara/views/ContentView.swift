@@ -14,7 +14,7 @@ struct ContentView: View {
     @State private var hasoffsets = haskernproc()
     @State private var showsettings = false
     @State private var selectedmethod: method = .hybrid
-    
+
     var body: some View {
         NavigationStack {
             List {
@@ -63,7 +63,7 @@ struct ContentView: View {
                         }
                         .disabled(mgr.dsrunning)
                         .disabled(mgr.dsready)
-                        
+
                         HStack {
                             Text("kernproc:")
                             Spacer()
@@ -71,7 +71,7 @@ struct ContentView: View {
                                 .font(.system(.body, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
-                        
+
                         HStack {
                             Text("rootvnode:")
                             Spacer()
@@ -79,7 +79,7 @@ struct ContentView: View {
                                 .font(.system(.body, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
-                        
+
                         if mgr.dsready {
                             HStack {
                                 Text("kernel_base:")
@@ -88,7 +88,7 @@ struct ContentView: View {
                                     .font(.system(.body, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }
-                            
+
                             HStack {
                                 Text("kernel_slide:")
                                 Spacer()
@@ -140,26 +140,26 @@ struct ContentView: View {
                                 }
                             }
                             .disabled(!mgr.dsready || mgr.vfsready || mgr.vfsrunning)
-                            
+
                             if mgr.vfsready {
                                 NavigationLink("Tweaks") {
                                     List {
                                         NavigationLink("Font Overwrite") {
                                             FontPicker(mgr: mgr)
                                         }
-                                        
+
                                         NavigationLink("Card Overwrite") {
                                             CardView()
                                         }
-                                        
+
                                         NavigationLink("Custom Overwrite") {
                                             CustomView(mgr: mgr)
                                         }
-                                        
+
                                         NavigationLink("DirtyZero (Broken)") {
                                             ZeroView(mgr: mgr)
                                         }
-                                        
+
                                         if !showfmintabs {
                                             NavigationLink("File Manager") {
                                                 SantanderView(startPath: "/")
@@ -202,7 +202,7 @@ struct ContentView: View {
                                 }
                             }
                             .disabled(!mgr.dsready || mgr.sbxready || mgr.sbxrunning)
-                            
+
                             if mgr.sbxready {
                                 NavigationLink("Tweaks") {
                                     List {
@@ -211,24 +211,28 @@ struct ContentView: View {
                                                 SantanderView(startPath: "/")
                                             }
                                         }
-                                        
+
                                         NavigationLink("Card Overwrite") {
                                             CardView()
                                         }
-                                        
+
                                         NavigationLink("3 App Bypass") {
                                             AppsView(mgr: mgr)
                                         }
-                                        
+
+                                        NavigationLink("VarClean") {
+                                            VarCleanView()
+                                        }
+
                                         NavigationLink("Unblacklist (Broken?)") {
                                             WhitelistView()
                                         }
-                                        
+
                                         if 1 == 2 {
                                             NavigationLink("MobileGestalt") {
                                                 EditorView()
                                             }
-                                            
+
                                             NavigationLink("Passcode Theme") {
                                                 PasscodeView(mgr: mgr)
                                             }
@@ -305,7 +309,7 @@ struct ContentView: View {
                                 }
                                 .disabled(!mgr.dsready || mgr.vfsready || mgr.vfsrunning)
                             }
-                            
+
                             if mgr.vfsready && mgr.sbxready {
                                 NavigationLink("Tweaks") {
                                     List {
@@ -314,44 +318,48 @@ struct ContentView: View {
                                                 SantanderView(startPath: "/")
                                             }
                                         }
-                                        
+
                                         NavigationLink("Font Overwrite") {
                                             FontPicker(mgr: mgr)
                                         }
-                                        
+
                                         NavigationLink("Card Overwrite") {
                                             CardView()
                                         }
-                                        
+
                                         NavigationLink("Custom Overwrite") {
                                             CustomView(mgr: mgr)
                                         }
-                                        
+
                                         NavigationLink("MobileGestalt") {
                                             EditorView()
                                         }
-                                        
+
                                         NavigationLink("3 App Bypass") {
                                             AppsView(mgr: mgr)
-                                        } 
-                                        
+                                        }
+
+                                        NavigationLink("VarClean") {
+                                            VarCleanView()
+                                        }
+
                                         NavigationLink("Whitelist") {
                                             WhitelistView()
                                         }
-                                        
+
                                         NavigationLink("DirtyZero") {
                                             ZeroView(mgr: mgr)
                                         }
-                                        
+
                                         if 1 == 2 {
                                             NavigationLink("Control Center") {
                                                 CCView()
                                             }
-                                            
+
                                             NavigationLink("Passcode Theme") {
                                                 PasscodeView(mgr: mgr)
                                             }
-                                            
+
                                             NavigationLink("3 App Bypass") {
                                                 AppsView(mgr: mgr)
                                             }
@@ -368,7 +376,7 @@ struct ContentView: View {
                             Text("Font Overwrite is only available in VFS or Hybrid mode. (Settings -> Method -> VFS/Hybrid)")
                         }
                     }
-                    
+
                     #if !DISABLE_REMOTECALL
                     Section {
                         Button("Init RemoteCall") {
@@ -384,12 +392,12 @@ struct ContentView: View {
                             }
                         }
                         .disabled(!mgr.dsready || mgr.remotecallrunning)
-                        
+
                         if mgr.remotecallrunning {
                             NavigationLink("Tweaks") {
                                 RemoteView(mgr: mgr)
                             }
-                            
+
                             Button("Destroy RemoteCall") {
                                 mgr.rcdestroy()
                             }
@@ -404,18 +412,18 @@ struct ContentView: View {
                     }
                     .disabled(isdebugged())
                     #endif
-                    
+
                     Section {
                         if mgr.dsready {
                             NavigationLink("Tools") {
                                 ToolsView()
                             }
                         }
-            
+
                         Button("Respring") {
                             mgr.respring()
                         }
-                        
+
                         Button("Panic!") {
                             mgr.panic()
                         }
@@ -424,7 +432,7 @@ struct ContentView: View {
                         Text("Other")
                     }
                 }
-                
+
             }
             .navigationTitle("lara")
             .toolbar {
@@ -447,7 +455,7 @@ struct ContentView: View {
             refreshselectedmethod()
         }
     }
-    
+
     private func refreshselectedmethod() {
         if let raw = UserDefaults.standard.string(forKey: "selectedmethod"),
            let m = method(rawValue: raw) {

@@ -11,6 +11,7 @@
 #import "apfs.h"
 #import "vfs.h"
 #import "sbx.h"
+#import "VarCleanBridge.h"
 
 // TaskRop / RemoteCall
 #import "kexploit/TaskRop/RemoteCall.h"
