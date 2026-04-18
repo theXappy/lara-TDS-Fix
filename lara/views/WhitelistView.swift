@@ -25,6 +25,7 @@ struct WhitelistView: View {
     ]
 
     @State private var contents: [String: String] = [:]
+    @State private var readDiag: [String: String] = [:]   // per-file read diagnostics
     @State private var status: String?
     @State private var patching = false
 
@@ -64,6 +65,14 @@ struct WhitelistView: View {
                                 .textSelection(.enabled)
                         }
                         .frame(minHeight: 120)
+
+                        // Diagnostic label — shows read method or exact failure reason
+                        if let diag = readDiag[f.path] {
+                            Text(diag)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                        }
                     } header: {
                         Text(f.name)
                     } footer: {
@@ -95,14 +104,18 @@ struct WhitelistView: View {
         patching = true
         defer { patching = false }
         var next: [String: String] = [:]
+        var nextDiag: [String: String] = [:]
         for f in files {
-            guard let data = sbxread(path: f.path, maxSize: 2 * 1024 * 1024) else {
+            let (data, diag) = sbxread(path: f.path, maxSize: 2 * 1024 * 1024)
+            nextDiag[f.path] = diag
+            guard let data = data else {
                 next[f.path] = "(failed to read)"
                 continue
             }
             next[f.path] = render(data: data)
         }
         contents = next
+        readDiag = nextDiag
     }
 
     private func patchall() {
@@ -142,24 +155,37 @@ struct WhitelistView: View {
 
     // MARK: - I/O
 
-    private func sbxread(path: String, maxSize: Int) -> Data? {
+    /// Reads a file, trying direct access first then falling back to VFS.
+    /// Returns the data and a diagnostic string showing what succeeded or
+    /// the exact error reason from both attempts.
+    ///
+    /// Previously sbxread had no VFS fallback, so failures were silent and
+    /// the UI showed "(failed to read)" with no indication of why or whether
+    /// VFS could have recovered the data.
+    private func sbxread(path: String, maxSize: Int) -> (Data?, String) {
+        // Attempt 1: direct file access
         do {
-            let url = URL(fileURLWithPath: path)
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            return data.count > maxSize ? data.prefix(maxSize) : data
-        } catch {
-            return nil
+            let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+            let trimmed = data.count > maxSize ? data.prefix(maxSize) : data
+            return (trimmed, "read: direct (\(trimmed.count) bytes)")
+        } catch let directErr {
+            // Attempt 2: VFS fallback
+            if mgr.vfsready {
+                if let data = mgr.vfsread(path: path, maxSize: maxSize) {
+                    return (data, "read: vfs (\(data.count) bytes) [direct failed: \(directErr.localizedDescription)]")
+                }
+                return (nil, "read failed — direct: \(directErr.localizedDescription) | vfs: returned nil")
+            }
+            return (nil, "read failed — direct: \(directErr.localizedDescription) | vfs: not ready")
         }
     }
 
-    /// Writes data to `path` by first writing to a temp file in the same
-    /// directory and then atomically renaming it into place. This avoids
-    /// opening the protected inode directly with O_TRUNC, which is what
-    /// causes EPERM on files guarded by mobileidentityd on hybrid jailbreaks.
+    /// Writes data to `path` by writing to a temp file in the same directory
+    /// and atomically renaming it into place, avoiding O_TRUNC on the guarded
+    /// inode. Falls back to VFS overwrite if rename fails.
     private func sbxwrite(path: String, data: Data) -> String {
         let tmp = path + ".laratmp"
 
-        // Write payload to the temp file
         let fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         guard fd != -1 else {
             return vfsfallback(
@@ -181,14 +207,10 @@ struct WhitelistView: View {
             )
         }
 
-        // Atomically rename the temp file over the target.
-        // rename(2) operates at the directory level and bypasses the guarded
-        // inode, succeeding where O_TRUNC on the original path would not.
         if rename(tmp, path) == 0 {
             return "ok (\(written) bytes via rename)"
         }
 
-        // Rename failed — clean up and fall through to VFS
         let renameErrno = errno
         unlink(tmp)
         return vfsfallback(
