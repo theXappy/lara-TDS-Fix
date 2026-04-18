@@ -5,7 +5,6 @@
 //  Created by ruter on 29.03.26.
 //  modified and fixed by claude, implemented by TheDiamondSquidy
 //
-
 import SwiftUI
 import Darwin
 
@@ -18,16 +17,27 @@ struct WhitelistView: View {
         let path: String
     }
 
+    /// The result of attempting to read a blacklist file.
+    private enum ReadResult {
+        case notPresent          // file doesn't exist — device is clean
+        case content(String)     // file exists and was read successfully
+        case readError(String)   // file exists but couldn't be read
+    }
+
     private let files: [wlfile] = [
-        .init(name: "Rejections.plist", path: "/private/var/db/MobileIdentityData/Rejections.plist"),
-        .init(name: "AuthListBannedUpps.plist", path: "/private/var/db/MobileIdentityData/AuthListBannedUpps.plist"),
+        .init(name: "Rejections.plist",            path: "/private/var/db/MobileIdentityData/Rejections.plist"),
+        .init(name: "AuthListBannedUpps.plist",     path: "/private/var/db/MobileIdentityData/AuthListBannedUpps.plist"),
         .init(name: "AuthListBannedCdHashes.plist", path: "/private/var/db/MobileIdentityData/AuthListBannedCdHashes.plist"),
     ]
 
-    @State private var contents: [String: String] = [:]
-    @State private var readDiag: [String: String] = [:]   // per-file read diagnostics
+    @State private var results: [String: ReadResult] = [:]
     @State private var status: String?
     @State private var patching = false
+
+    /// True only if at least one blacklist file was actually found on disk.
+    private var anyFilePresent: Bool {
+        results.values.contains { if case .content = $0 { return true }; return false }
+    }
 
     var body: some View {
         NavigationStack {
@@ -50,28 +60,53 @@ struct WhitelistView: View {
                     Button("Patch (Empty Plist)") {
                         patchall()
                     }
-                    .disabled(!mgr.sbxready || patching)
+                    // Only enable patching when there is actually something to patch
+                    .disabled(!mgr.sbxready || patching || !anyFilePresent)
                 } header: {
                     Text("Actions")
                 } footer: {
-                    Text("Overwrites MobileIdentityData blacklist files with an empty plist.")
+                    if !results.isEmpty && !anyFilePresent {
+                        Text("No blacklist files found — this device does not appear to be flagged.")
+                    } else {
+                        Text("Overwrites MobileIdentityData blacklist files with an empty plist.")
+                    }
                 }
 
                 ForEach(files) { f in
                     Section {
-                        ScrollView {
-                            Text(contents[f.path] ?? "(not loaded)")
+                        switch results[f.path] {
+                        case .none:
+                            Text("(not loaded)")
                                 .font(.system(size: 13, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
-                        .frame(minHeight: 120)
-
-                        // Diagnostic label — shows read method or exact failure reason
-                        if let diag = readDiag[f.path] {
-                            Text(diag)
-                                .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
-                                .textSelection(.enabled)
+
+                        case .notPresent:
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark.shield.fill")
+                                    .foregroundColor(.green)
+                                Text("Not present — device is not blacklisted")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundColor(.green)
+                            }
+
+                        case .content(let text):
+                            ScrollView {
+                                Text(text)
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            .frame(minHeight: 120)
+
+                        case .readError(let reason):
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("(failed to read)")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundColor(.red)
+                                Text(reason)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                            }
                         }
                     } header: {
                         Text(f.name)
@@ -103,24 +138,16 @@ struct WhitelistView: View {
         }
         patching = true
         defer { patching = false }
-        var next: [String: String] = [:]
-        var nextDiag: [String: String] = [:]
+        var next: [String: ReadResult] = [:]
         for f in files {
-            let (data, diag) = sbxread(path: f.path, maxSize: 2 * 1024 * 1024)
-            nextDiag[f.path] = diag
-            guard let data = data else {
-                next[f.path] = "(failed to read)"
-                continue
-            }
-            next[f.path] = render(data: data)
+            next[f.path] = sbxread(path: f.path, maxSize: 2 * 1024 * 1024)
         }
-        contents = next
-        readDiag = nextDiag
+        results = next
     }
 
     private func patchall() {
-        guard mgr.sbxready else {
-            status = "sandbox escape not ready"
+        guard mgr.sbxready, anyFilePresent else {
+            status = "nothing to patch — no blacklist files present"
             return
         }
         patching = true
@@ -138,6 +165,8 @@ struct WhitelistView: View {
         var failures: [String] = []
 
         for f in files {
+            // Only attempt to write files that actually exist
+            guard case .content = results[f.path] else { continue }
             let result = sbxwrite(path: f.path, data: data)
             if !result.hasPrefix("ok") {
                 failures.append("\(f.name): \(result)")
@@ -155,34 +184,41 @@ struct WhitelistView: View {
 
     // MARK: - I/O
 
-    /// Reads a file, trying direct access first then falling back to VFS.
-    /// Returns the data and a diagnostic string showing what succeeded or
-    /// the exact error reason from both attempts.
-    ///
-    /// Previously sbxread had no VFS fallback, so failures were silent and
-    /// the UI showed "(failed to read)" with no indication of why or whether
-    /// VFS could have recovered the data.
-    private func sbxread(path: String, maxSize: Int) -> (Data?, String) {
-        // Attempt 1: direct file access
-        do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
-            let trimmed = data.count > maxSize ? data.prefix(maxSize) : data
-            return (trimmed, "read: direct (\(trimmed.count) bytes)")
-        } catch let directErr {
-            // Attempt 2: VFS fallback
-            if mgr.vfsready {
-                if let data = mgr.vfsread(path: path, maxSize: maxSize) {
-                    return (data, "read: vfs (\(data.count) bytes) [direct failed: \(directErr.localizedDescription)]")
-                }
-                return (nil, "read failed — direct: \(directErr.localizedDescription) | vfs: returned nil")
-            }
-            return (nil, "read failed — direct: \(directErr.localizedDescription) | vfs: not ready")
+    /// Reads a file, distinguishing between "doesn't exist" (clean device)
+    /// and "exists but unreadable" (permission/MACF issue).
+    private func sbxread(path: String, maxSize: Int) -> ReadResult {
+        let fm = FileManager.default
+
+        // Check existence before attempting a read so we can give the right
+        // result for a clean device vs a permission failure on an existing file.
+        let exists = fm.fileExists(atPath: path) || (mgr.vfsready && vfsExists(path: path))
+
+        guard exists else {
+            return .notPresent
         }
+
+        // Attempt 1: direct read
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) {
+            let trimmed = data.count > maxSize ? data.prefix(maxSize) : data
+            return .content(render(data: trimmed))
+        }
+
+        // Attempt 2: VFS fallback
+        if mgr.vfsready, let data = mgr.vfsread(path: path, maxSize: maxSize) {
+            return .content(render(data: data))
+        }
+
+        let errDesc = String(cString: strerror(errno))
+        return .readError("errno=\(errno) \(errDesc)\(mgr.vfsready ? " | vfs returned nil" : " | vfs not ready")")
     }
 
-    /// Writes data to `path` by writing to a temp file in the same directory
-    /// and atomically renaming it into place, avoiding O_TRUNC on the guarded
-    /// inode. Falls back to VFS overwrite if rename fails.
+    /// Lightweight existence check via VFS for paths not reachable by FileManager.
+    private func vfsExists(path: String) -> Bool {
+        mgr.vfsread(path: path, maxSize: 1) != nil
+    }
+
+    /// Writes data using a temp file + atomic rename to avoid O_TRUNC on
+    /// guarded inodes. Falls back to VFS overwrite if rename fails.
     private func sbxwrite(path: String, data: Data) -> String {
         let tmp = path + ".laratmp"
 
@@ -235,16 +271,12 @@ struct WhitelistView: View {
            let xml = String(data: xmlData, encoding: .utf8) {
             return xml
         }
-
         if let s = String(data: data, encoding: .utf8) {
             return s
         }
-
         let maxBytes = min(data.count, 4096)
         let hex = data.prefix(maxBytes).map { String(format: "%02x", $0) }.joined(separator: " ")
-        if data.count > maxBytes {
-            return hex + "\n... (\(data.count) bytes total)"
-        }
-        return hex
+        return data.count > maxBytes ? hex + "\n... (\(data.count) bytes total)" : hex
     }
 }
+
