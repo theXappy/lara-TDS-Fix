@@ -16,6 +16,7 @@ struct ContentView: View {
     @State private var selectedmethod: method = .hybrid
 
     var body: some View {
+        TabView {
         NavigationStack {
             List {
                 if !hasoffsets {
@@ -162,9 +163,9 @@ struct ContentView: View {
                                             NavigationLink("File Manager") {
                                                 SantanderView(startPath: "/")
                                             }
-                                            NavigationLink("Remotecall RW Manager( {
-                                                           FileManagerView()
-                                                          }
+                                            NavigationLink("RC File Manager") {
+                                                FileManagerView()
+                                            }
                                         }
                                     }
                                     .navigationTitle(Text("Tweaks"))
@@ -477,6 +478,18 @@ struct ContentView: View {
                 }
             }
         }
+        .tabItem {
+            Label("Home", systemImage: "house")
+        }
+
+        NavigationStack {
+            FileManagerView()
+        }
+        .tabItem {
+            Label("RC File Manager", systemImage: "folder.badge.gear")
+        }
+
+        } // end TabView
         .sheet(isPresented: $showsettings) {
             SettingsView(mgr: mgr, hasoffsets: $hasoffsets)
         }
