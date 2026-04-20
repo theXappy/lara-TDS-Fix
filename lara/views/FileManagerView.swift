@@ -39,6 +39,18 @@ struct FileManagerView: View {
     @State private var showPool = true
     @State private var lastOpResult: RCIOResult?
 
+    // Delete
+    @State private var deleteTarget: String?
+    @State private var showDeleteConfirm = false
+
+    // Copy / Paste
+    @State private var copyBuffer: (path: String, name: String)?
+
+    // Rename
+    @State private var renameTarget: String?
+    @State private var renameDest: String = ""
+    @State private var showRename = false
+
     var body: some View {
         VStack(spacing: 0) {
             breadcrumb
@@ -50,6 +62,16 @@ struct FileManagerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                if let buf = copyBuffer {
+                    Button {
+                        handlePaste(buf)
+                    } label: {
+                        Label("Paste \(buf.name)", systemImage: "doc.on.clipboard.fill")
+                            .foregroundColor(.mint)
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                }
+
                 Button {
                     withAnimation { showDebug.toggle() }
                 } label: {
@@ -59,7 +81,7 @@ struct FileManagerView: View {
 
                 Button {
                     showPicker = true
-                    selectedFile = nil   // nil = create new file at current path
+                    selectedFile = nil
                 } label: {
                     Image(systemName: "plus")
                 }
@@ -69,6 +91,22 @@ struct FileManagerView: View {
         .alert("Status", isPresented: .constant(status != nil)) {
             Button("OK") { status = nil }
         } message: { Text(status ?? "") }
+        .alert("Delete", isPresented: $showDeleteConfirm, presenting: deleteTarget) { target in
+            Button("Delete", role: .destructive) { handleDelete(target) }
+            Button("Cancel", role: .cancel) {}
+        } message: { target in
+            Text("Permanently delete \(URL(fileURLWithPath: target).lastPathComponent)?")
+        }
+        .alert("Rename", isPresented: $showRename, presenting: renameTarget) { target in
+            TextField("New name", text: $renameDest)
+            Button("Rename") {
+                let dest = (path == "/" ? "" : path) + "/" + renameDest
+                handleMove(from: target, to: dest)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { target in
+            Text("Rename \(URL(fileURLWithPath: target).lastPathComponent)")
+        }
         .sheet(isPresented: $showPicker) {
             RCFilePicker(data: $pickedData, filename: $pickedName)
         }
@@ -306,7 +344,7 @@ struct FileManagerView: View {
 
     @ViewBuilder
     private func entryRow(_ entry: (name: String, isDir: Bool, size: Int64)) -> some View {
-        let fullPath = path + "/" + entry.name
+        let fullPath = (path == "/" ? "" : path) + "/" + entry.name
 
         HStack(spacing: 10) {
             // Icon
@@ -368,20 +406,46 @@ struct FileManagerView: View {
         .swipeActions(edge: .leading) {
             Button {
                 UIPasteboard.general.string = fullPath
-                status = "Copied: \(fullPath)"
+                status = "Copied path: \(fullPath)"
             } label: {
                 Label("Copy Path", systemImage: "doc.on.doc")
             }
             .tint(.blue)
+
+            Button {
+                copyBuffer = (path: fullPath, name: entry.name)
+                status = entry.isDir ? "Directories cannot be copied yet" : "Buffered: \(entry.name)"
+            } label: {
+                Label("Copy", systemImage: "doc.on.clipboard")
+            }
+            .tint(.mint)
+            .disabled(entry.isDir)
+
+            Button {
+                renameTarget = fullPath
+                renameDest = entry.name
+                showRename = true
+            } label: {
+                Label("Rename", systemImage: "pencil")
+            }
+            .tint(.indigo)
         }
         .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                deleteTarget = fullPath
+                showDeleteConfirm = true
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+
             if !entry.isDir {
-                Button(role: .destructive) {
+                Button {
                     selectedFile = fullPath
                     showPicker = true
                 } label: {
                     Label("Overwrite", systemImage: "arrow.up.doc.fill")
                 }
+                .tint(.orange)
             }
         }
     }
@@ -389,11 +453,9 @@ struct FileManagerView: View {
     // MARK: - Navigation and loading
 
     private func navigate(to newPath: String) {
-        // Resolve symlinks to a canonical path before navigating.
-        // On iOS /private is a circular symlink back to root, so without this
-        // tapping "private" builds /private/private/private/... forever while
-        // VFS just lists root each time. realpath() returns nil for paths we
-        // can't stat (MAC-protected dirs), falling back to the literal path.
+        // Resolve symlinks to canonical path — on iOS /private is a circular
+        // symlink to root, so without this tapping "private" builds
+        // /private/private/private/... forever while VFS lists root each time.
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         let canonical = (Darwin.realpath(newPath, &buf) != nil) ? String(cString: buf) : newPath
         path = canonical
@@ -401,12 +463,17 @@ struct FileManagerView: View {
     }
 
     private func loadEntries() {
+        // Snapshot path on the main thread before dispatching — reading @State
+        // from a background thread is unsafe and returns stale values.
+        let targetPath = path
         loading = true
         entries = []
         listSource = ""
         DispatchQueue.global(qos: .userInitiated).async {
-            let (e, src) = rcio.listDir(path: self.path)
+            let (e, src) = rcio.listDir(path: targetPath)
             DispatchQueue.main.async {
+                // Discard result if user navigated away during the fetch
+                guard self.path == targetPath else { return }
                 self.entries = e
                 self.listSource = src
                 self.loading = false
@@ -448,6 +515,49 @@ struct FileManagerView: View {
             DispatchQueue.main.async {
                 self.previewResult = (data, result)
                 self.lastOpResult = result
+            }
+        }
+    }
+
+    private func handleDelete(_ path: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = rcio.delete(path: path)
+            DispatchQueue.main.async {
+                self.lastOpResult = result
+                self.status = result.message
+                if result.ok { self.loadEntries() }
+            }
+        }
+    }
+
+    private func handlePaste(_ buf: (path: String, name: String)) {
+        // Copy file: read from source then write to current directory
+        let dest = (path == "/" ? "" : path) + "/" + buf.name
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (data, readResult) = rcio.read(path: buf.path)
+            guard let data else {
+                DispatchQueue.main.async { self.status = "Copy failed: \(readResult.message)" }
+                return
+            }
+            let writeResult = rcio.write(path: dest, data: data)
+            DispatchQueue.main.async {
+                self.lastOpResult = writeResult
+                self.status = writeResult.message
+                if writeResult.ok {
+                    self.copyBuffer = nil
+                    self.loadEntries()
+                }
+            }
+        }
+    }
+
+    private func handleMove(from src: String, to dst: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = rcio.move(from: src, to: dst)
+            DispatchQueue.main.async {
+                self.lastOpResult = result
+                self.status = result.message
+                if result.ok { self.loadEntries() }
             }
         }
     }
