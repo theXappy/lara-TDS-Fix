@@ -173,6 +173,11 @@ struct ContentView: View {
                                                 } label: {
                                                     Label("File Manager", systemImage: "folder")
                                                 }
+                                                NavigationLink {
+                                                    SantanderView(startPath: "/")
+                                                } label: {
+                                                    Label("Remotecall RW Manager", systemImage: "folder")
+                                                }
                                             }
                                             
                                             NavigationLink {
