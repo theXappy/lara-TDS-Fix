@@ -207,7 +207,7 @@ struct WhitelistView: View {
         // Attempt 1: direct write (post-sbx-escape)
         let fd = open(path, O_WRONLY | O_TRUNC, 0o644)   // no O_CREAT — we only patch existing files
         if fd != -1 {
-            let n = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
             close(fd)
             if n == data.count { return "ok (\(n) bytes direct)" }
         }
