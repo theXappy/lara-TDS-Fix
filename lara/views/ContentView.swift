@@ -18,6 +18,7 @@ struct ContentView: View {
     let os = ProcessInfo().operatingSystemVersion
 
     var body: some View {
+        TabView {
         NavigationStack {
             List {
                 if !hasoffsets {
@@ -177,6 +178,9 @@ struct ContentView: View {
                                                     SantanderView(startPath: "/")
                                                 } label: {
                                                     Label("Remotecall RW Manager", systemImage: "folder")
+                                                }
+                                                NavigationLink("RC File Manager") {
+                                                    FileManagerView()
                                                 }
                                             }
                                             
@@ -562,6 +566,18 @@ struct ContentView: View {
                 }
             }
         }
+        .tabItem {
+            Label("Home", systemImage: "house")
+        }
+
+        NavigationStack {
+            FileManagerView()
+        }
+        .tabItem {
+            Label("RC File Manager", systemImage: "folder.badge.gear")
+        }
+
+        } // end TabView
         .sheet(isPresented: $showsettings) {
             SettingsView(mgr: mgr, hasoffsets: $hasoffsets)
         }
