@@ -454,28 +454,106 @@ final class RemoteFileIO: ObservableObject {
 
     // MARK: - Directory listing
 
-    /// Lists a directory using VFS (broadest access) with FileManager fallback.
+    /// Lists a directory. Fallback chain:
+    ///   1. VFS              — bypasses most sandbox restrictions
+    ///   2. FileManager      — works post-sbx-escape for accessible paths
+    ///   3. RemoteCall       — opendir/readdir/closedir in a routed process
     func listDir(path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String) {
-        // VFS is the primary source — it bypasses most sandbox restrictions
+
+        // Tier 1: VFS
         if mgr.vfsready, let items = mgr.vfslistdir(path: path) {
             let enriched = items.map { (name: $0.name, isDir: $0.isDir,
                                         size: $0.isDir ? -1 : mgr.vfssize(path: path + "/" + $0.name)) }
             return (enriched, "vfs")
         }
 
-        // FileManager fallback (post-sbx-escape)
+        // Tier 2: FileManager (post-sbx-escape, fast for accessible paths)
         let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: path) else {
-            return ([], "failed")
+        if let names = try? fm.contentsOfDirectory(atPath: path) {
+            let entries = names.sorted().map { name -> (String, Bool, Int64) in
+                let full = (path == "/" ? "" : path) + "/" + name
+                var isDir: ObjCBool = false
+                fm.fileExists(atPath: full, isDirectory: &isDir)
+                let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1
+                return (name, isDir.boolValue, size ?? -1)
+            }
+            return (entries, "filemanager")
         }
-        let entries = names.sorted().map { name -> (String, Bool, Int64) in
-            let full = path + "/" + name
-            var isDir: ObjCBool = false
-            fm.fileExists(atPath: full, isDirectory: &isDir)
-            let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1
-            return (name, isDir.boolValue, size ?? -1)
+
+        // Tier 3: RemoteCall — opendir/readdir/closedir inside a routed process.
+        // This is the only tier that can list directories protected by MAC policy
+        // (e.g. /private/var/Keychains, /private/var/db, container dirs).
+        let best = rcBestProcess(for: path)
+        var candidates = [best]
+        for proc in Self.fallbackOrder where proc != best { candidates.append(proc) }
+
+        for proc in candidates {
+            if let items = rcListDirIn(path: path, process: proc) {
+                mgr.logmsg("(rcio) listDir \(path) via \(proc): \(items.count) entries")
+                let enriched = items.map { (name: $0.name, isDir: $0.isDir, size: Int64(-1)) }
+                return (enriched, "rc:\(proc)")
+            }
         }
-        return (entries, "filemanager")
+
+        return ([], "failed")
+    }
+
+    /// Calls opendir/readdir/closedir inside the named RC process.
+    /// Returns nil if the process isn't ready or the directory can't be opened.
+    private func rcListDirIn(path: String, process: String) -> [(name: String, isDir: Bool)]? {
+        guard let rc = rcProc(for: process) else { return nil }
+
+        let pathBytes = Array((path + "\0").utf8)
+        let trojanMem = rc.trojanMem
+        guard trojanMem != 0 else { return nil }
+
+        // Write the path into trojanMem (same pattern as rcRead/rcWrite)
+        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
+
+        // opendir(path) — runs inside the remote process, inheriting its MAC context
+        let dirPtr = callIn(rc: rc, name: "opendir", args: [trojanMem])
+        guard dirPtr != 0 else { return nil }
+        defer { _ = callIn(rc: rc, name: "closedir", args: [dirPtr]) }
+
+        // Darwin struct dirent layout (sys/dirent.h):
+        //   offset  0: d_ino      UInt64  (8 bytes)
+        //   offset  8: d_seekoff  UInt64  (8 bytes)
+        //   offset 16: d_reclen   UInt16  (2 bytes)
+        //   offset 18: d_namlen   UInt16  (2 bytes)
+        //   offset 20: d_type     UInt8   (1 byte)
+        //   offset 21: d_name     char[]  (up to 1024 bytes)
+        // DT_DIR = 4, DT_REG = 8, DT_LNK = 10
+        let direntReadSize: UInt64 = 21 + 256  // header + generous name room
+
+        var result: [(name: String, isDir: Bool)] = []
+
+        while true {
+            // readdir(dirp) returns dirent* inside the remote DIR buffer, or NULL at end
+            let direntPtr = callIn(rc: rc, name: "readdir", args: [dirPtr])
+            guard direntPtr != 0 else { break }
+
+            // Pull the dirent struct out of the remote process address space
+            var buf = [UInt8](repeating: 0, count: Int(direntReadSize))
+            let ok = buf.withUnsafeMutableBytes { ptr in
+                rc.remoteRead(direntPtr, to: ptr.baseAddress, size: direntReadSize)
+            }
+            guard ok else { continue }
+
+            let namlen = Int(UInt16(buf[18]) | (UInt16(buf[19]) << 8))
+            let dtype  = buf[20]
+
+            guard namlen > 0, 21 + namlen <= buf.count else { continue }
+
+            let nameBytes = Array(buf[21..<(21 + namlen)])
+            guard let name = String(bytes: nameBytes, encoding: .utf8),
+                  name != ".", name != ".." else { continue }
+
+            result.append((name: name, isDir: dtype == 4 /* DT_DIR */))
+        }
+
+        // Return nil rather than empty so the caller can try the next process
+        guard !result.isEmpty else { return nil }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     // MARK: - Private helpers
