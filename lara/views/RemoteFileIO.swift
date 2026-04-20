@@ -173,7 +173,7 @@ final class RemoteFileIO: ObservableObject {
         let entry = pool[process]
         pool[process] = RCPoolEntry(process: process, state: .uninitialized, rc: nil)
         poolLock.unlock()
-        entry?.rc?.destroyRemoteCall()
+        entry?.rc?.destroy()
         DispatchQueue.main.async { self.objectWillChange.send() }
     }
 
