@@ -26,6 +26,7 @@
 //
 
 import Foundation
+import Combine
 import Darwin
 
 // MARK: - Diagnostics types
