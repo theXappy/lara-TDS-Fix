@@ -162,6 +162,9 @@ struct ContentView: View {
                                             NavigationLink("File Manager") {
                                                 SantanderView(startPath: "/")
                                             }
+                                            NavigationLink("Remotecall RW Manager( {
+                                                           FileManagerView()
+                                                          }
                                         }
                                     }
                                     .navigationTitle(Text("Tweaks"))
