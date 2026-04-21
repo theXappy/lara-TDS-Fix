@@ -319,7 +319,11 @@ struct ProcessDetailSheet: View {
                 }
 
                 // File jurisdiction
-                Section(header: Text("File Jurisdiction")) {
+                Section(
+                    header: Text("File Jurisdiction"),
+                    footer: Text("Suggested path is estimated from process privilege. Use RC File Manager to navigate freely.")
+                        .font(.caption)
+                ) {
                     // Navigate button — pushes RC file manager at the suggested path
                     NavigationLink {
                         FileManagerViewAtPath(startPath: process.suggestedPath)
@@ -333,13 +337,14 @@ struct ProcessDetailSheet: View {
                     } label: {
                         Label("Copy Suggested Path", systemImage: "doc.on.doc")
                     }
-                } footer: {
-                    Text("Suggested path is estimated from process privilege. Use RC File Manager to navigate freely.")
-                        .font(.caption)
                 }
 
                 // Terminate
-                Section("Terminate") {
+                Section(
+                    header: Text("Terminate"),
+                    footer: Text("Killing root processes may require root or RC. Mobile processes can be killed post-sbx-escape.")
+                        .font(.caption)
+                ) {
                     if let status = killStatus {
                         Text(status)
                             .font(.system(size: 12, design: .monospaced))
@@ -358,9 +363,6 @@ struct ProcessDetailSheet: View {
                     } label: {
                         Label("Send SIGKILL (force)", systemImage: "xmark.octagon.fill")
                     }
-                } footer: {
-                    Text("Killing root processes may require root or RC. Mobile processes can be killed post-sbx-escape.")
-                        .font(.caption)
                 }
             }
             .listStyle(.insetGrouped)
