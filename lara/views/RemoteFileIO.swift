@@ -201,7 +201,7 @@ final class RemoteFileIO: ObservableObject {
         let old = pool[process]
         pool[process] = RCPoolEntry(process: process, state: .uninitialized, rc: nil)
         poolLock.unlock()
-        old?.rc?.destroyRemoteCall()
+        old?.rc?.destroy()
         publish()
     }
 
