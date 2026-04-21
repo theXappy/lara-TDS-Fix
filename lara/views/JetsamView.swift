@@ -31,9 +31,9 @@ private func memorystatus_control(
     _ buffersize: Int
 ) -> Int32
 
-private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:      UInt32 = 1
-private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES: UInt32 = 7
-private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK: UInt32 = 5
+private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:      Int32 = 1
+private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES: Int32 = 7
+private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK: Int32 = 5
 
 // MARK: - Data model
 
@@ -147,7 +147,7 @@ struct JetsamView: View {
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.secondary)
                     Button("Restore") {
-                        restore(pid: proc.pid)
+                        restore(pid: Int32(proc.pid))
                     }
                     .font(.system(size: 12))
                     .buttonStyle(.bordered)
@@ -397,15 +397,15 @@ struct JetsamView: View {
         let band    = Int32(proc.targetBand)
         let limitMB = Int32(proc.limitMB)
 
-        var ok = setJetsamBand(pid: proc.pid, band: band)
+        var ok = setJetsamBand(pid: Int32(proc.pid), band: band)
 
         if limitMB == -1 {
             // Unlimited: use a very large value for the high-water-mark command
             _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     proc.pid, UInt32(bitPattern: Int32.max), nil, 0)
+                                     Int32(proc.pid), UInt32(bitPattern: Int32.max), nil, 0)
         } else if limitMB > 0 {
             _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     proc.pid, UInt32(bitPattern: limitMB), nil, 0)
+                                     Int32(proc.pid), UInt32(bitPattern: limitMB), nil, 0)
         }
 
         processes[idx].isProtected = ok
@@ -416,7 +416,7 @@ struct JetsamView: View {
     }
 
     private func restore(pid: Int32) {
-        guard let idx = processes.firstIndex(where: { $0.pid == pid }) else { return }
+        guard let idx = processes.firstIndex(where: { $0.pid == UInt32(pid) }) else { return }
         let proc = processes[idx]
         _ = setJetsamBand(pid: pid, band: Int32(proc.origBand))
         processes[idx].isProtected = false
@@ -425,7 +425,7 @@ struct JetsamView: View {
 
     private func restoreAll() {
         for proc in protectedProcesses {
-            _ = setJetsamBand(pid: proc.pid, band: Int32(proc.origBand))
+            _ = setJetsamBand(pid: Int32(proc.pid), band: Int32(proc.origBand))
             if let idx = processes.firstIndex(where: { $0.pid == proc.pid }) {
                 processes[idx].isProtected = false
             }
