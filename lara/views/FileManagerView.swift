@@ -1,10 +1,12 @@
 //
 //  FileManagerView.swift
-//  lara
+//  lara — TDS fork
 //
-//  File manager backed by RemoteFileIO.
-//  Debug panel: compact Processes button (opens ProcessSelectorView), op log,
-//  and a process override pill that routes all operations through a chosen process.
+//  RC-backed file manager.
+//  ─ Single nav bar; Lara FM accessible via leading toolbar button.
+//  ─ Process override (isolation) propagated to ALL operations including delete/move.
+//  ─ Directory listing: VFS → FileManager → RC opendir (tier 3 restored).
+//  ─ Debug panel: compact Processes button, op log, override pill.
 //
 
 import SwiftUI
@@ -20,31 +22,31 @@ struct FileManagerView: View {
     @State private var path: String = "/private/var"
     @State private var entries: [(name: String, isDir: Bool, size: Int64)] = []
     @State private var listSource: String = ""
-    @State private var loading = false
+    @State private var loading    = false
     @State private var status: String?
 
     // File operation state
     @State private var selectedFile: String?
-    @State private var showPicker = false
-    @State private var pickedData: Data?
-    @State private var pickedName: String?
+    @State private var showPicker   = false
+    @State private var pickedData:  Data?
+    @State private var pickedName:  String?
 
     // Preview
-    @State private var previewPath: String?
+    @State private var previewPath:   String?
     @State private var previewResult: (data: Data?, result: RCIOResult)?
-    @State private var showPreview = false
+    @State private var showPreview    = false
 
     // Debug panel
-    @State private var showDebug   = true
-    @State private var showLog     = false
+    @State private var showDebug = true
+    @State private var showLog   = false
     @State private var lastOpResult: RCIOResult?
 
     // Process selector / override
     @State private var showProcessSelector = false
-    @State private var processOverride: String? = nil   // nil = auto routing
+    @State private var processOverride: String? = nil   // nil = auto-routing
 
     // Delete
-    @State private var deleteTarget: String?
+    @State private var deleteTarget:   String?
     @State private var showDeleteConfirm = false
 
     // Copy / Paste
@@ -67,6 +69,21 @@ struct FileManagerView: View {
         .navigationTitle("RC File Manager")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            // Leading: access to Lara FM
+            ToolbarItem(placement: .navigationBarLeading) {
+                NavigationLink {
+                    SantanderView(startPath: "/")
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                        Text("Lara FM")
+                            .font(.system(size: 12, design: .monospaced))
+                    }
+                }
+                .disabled(!mgr.sbxready && !mgr.vfsready)
+            }
+
+            // Trailing: paste buffer, debug toggle, upload
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 if let buf = copyBuffer {
                     Button { handlePaste(buf) } label: {
@@ -141,7 +158,9 @@ struct FileManagerView: View {
                     .foregroundColor(.blue)
 
                 ForEach(Array(pathComponents.enumerated()), id: \.offset) { i, part in
-                    Text(" / ").font(.system(size: 12, design: .monospaced)).foregroundColor(.secondary)
+                    Text(" / ")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
                     Button(part) {
                         navigate(to: "/" + pathComponents[0...i].joined(separator: "/"))
                     }
@@ -159,12 +178,12 @@ struct FileManagerView: View {
         path.components(separatedBy: "/").filter { !$0.isEmpty }
     }
 
-    // MARK: - Debug panel (streamlined)
+    // MARK: - Debug panel
 
     private var debugPanel: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                // Processes button — replaces old scrolling tile pool view
+                // Processes button
                 Button {
                     showProcessSelector = true
                 } label: {
@@ -178,8 +197,9 @@ struct FileManagerView: View {
                 .tint(anyReady ? .green : .secondary)
                 .controlSize(.mini)
 
-                // Override indicator / auto-route label
+                // Override pill — shows active isolation or auto-route label
                 if let ov = processOverride {
+                    // Tapping the pill clears the override
                     Button {
                         processOverride = nil
                     } label: {
@@ -202,7 +222,7 @@ struct FileManagerView: View {
 
                 Spacer()
 
-                // Log toggle
+                // Op log toggle
                 Button {
                     withAnimation { showLog.toggle() }
                 } label: {
@@ -221,20 +241,17 @@ struct FileManagerView: View {
             .padding(.horizontal, 10)
             .padding(.top, 6)
 
-            // Op log inline view (shown when toggled)
             if showLog {
                 opLogView
             }
 
-            // Last operation result
             if let r = lastOpResult {
                 lastOpBar(r)
             }
 
-            // Directory listing info
             if !listSource.isEmpty {
                 HStack {
-                    Text("src:\(listSource)  \(entries.count) entries")
+                    Text("src:\(listSource)  \(entries.count) entries  \(path)")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
                         .lineLimit(1)
@@ -318,20 +335,29 @@ struct FileManagerView: View {
     private var fileList: some View {
         List {
             if loading {
-                HStack { Spacer(); ProgressView(); Text("Loading...").foregroundColor(.secondary); Spacer() }
+                HStack {
+                    Spacer()
+                    ProgressView()
+                    Text("Loading...").foregroundColor(.secondary)
+                    Spacer()
+                }
             } else if entries.isEmpty {
                 Text("Empty or inaccessible")
                     .font(.system(.body, design: .monospaced))
                     .foregroundColor(.secondary)
             } else {
+                // Parent directory button
                 if path != "/" {
                     Button {
                         let parent = (path as NSString).deletingLastPathComponent
                         navigate(to: parent.isEmpty ? "/" : parent)
                     } label: {
                         HStack {
-                            Image(systemName: "arrow.up.doc.fill").foregroundColor(.secondary).frame(width: 22)
-                            Text("..").font(.system(.body, design: .monospaced))
+                            Image(systemName: "arrow.up.doc.fill")
+                                .foregroundColor(.secondary)
+                                .frame(width: 22)
+                            Text("..")
+                                .font(.system(.body, design: .monospaced))
                         }
                     }
                 }
@@ -363,7 +389,7 @@ struct FileManagerView: View {
                         Text(entry.size.fileSizeString)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundColor(.secondary)
-                        // Show effective process — orange if override is active
+                        // Show override process in orange, or auto-routed in secondary
                         let effective = processOverride ?? rcio.rcBestProcess(for: fullPath)
                         Text(effective)
                             .font(.system(size: 9, design: .monospaced))
@@ -401,7 +427,7 @@ struct FileManagerView: View {
         .swipeActions(edge: .leading) {
             Button {
                 UIPasteboard.general.string = fullPath
-                status = "Copied path: \(fullPath)"
+                status = "Copied: \(fullPath)"
             } label: {
                 Label("Copy Path", systemImage: "doc.on.doc")
             }
@@ -448,6 +474,8 @@ struct FileManagerView: View {
     // MARK: - Navigation and loading
 
     private func navigate(to newPath: String) {
+        // Resolve symlinks so tapping "private" (which is /private → /)
+        // doesn't build /private/private/private/... forever.
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         let canonical = (Darwin.realpath(newPath, &buf) != nil) ? String(cString: buf) : newPath
         path = canonical
@@ -455,13 +483,16 @@ struct FileManagerView: View {
     }
 
     private func loadEntries() {
+        // Snapshot path on the main thread before dispatching.
         let targetPath = path
         loading    = true
         entries    = []
         listSource = ""
+
         DispatchQueue.global(qos: .userInitiated).async {
             let (e, src) = rcio.listDir(path: targetPath)
             DispatchQueue.main.async {
+                // Discard if user navigated away during fetch
                 guard self.path == targetPath else { return }
                 self.entries    = e
                 self.listSource = src
@@ -470,7 +501,8 @@ struct FileManagerView: View {
         }
     }
 
-    // MARK: - File operations (pass override through to rcio)
+    // MARK: - File operations
+    // Every RC operation passes processOverride so isolation is honoured.
 
     private func handlePickedData(_ data: Data) {
         let target: String
@@ -478,7 +510,7 @@ struct FileManagerView: View {
             target = sel
         } else {
             let name = pickedName ?? "lara_new_\(Int(Date().timeIntervalSince1970)).bin"
-            target = path + "/" + name
+            target = (path == "/" ? "" : path) + "/" + name
         }
         selectedFile = nil
         pickedName   = nil
@@ -499,7 +531,8 @@ struct FileManagerView: View {
         showPreview   = true
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let (data, result) = rcio.read(path: path, maxSize: 256 * 1024, override: self.processOverride)
+            let (data, result) = rcio.read(path: path, maxSize: 256 * 1024,
+                                           override: self.processOverride)
             DispatchQueue.main.async {
                 self.previewResult = (data, result)
                 self.lastOpResult  = result
@@ -509,7 +542,8 @@ struct FileManagerView: View {
 
     private func handleDelete(_ path: String) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = rcio.delete(path: path)
+            // Pass override so isolation is respected for delete too
+            let result = rcio.delete(path: path, override: self.processOverride)
             DispatchQueue.main.async {
                 self.lastOpResult = result
                 self.status       = result.message
@@ -540,7 +574,7 @@ struct FileManagerView: View {
 
     private func handleMove(from src: String, to dst: String) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = rcio.move(from: src, to: dst)
+            let result = rcio.move(from: src, to: dst, override: self.processOverride)
             DispatchQueue.main.async {
                 self.lastOpResult = result
                 self.status       = result.message
@@ -561,25 +595,25 @@ struct FileManagerView: View {
         return "Procs \(ready)/\(total)"
     }
 
-    // MARK: - Colour / icon helpers
+    // MARK: - Icon helper
 
     private func fileIcon(for name: String) -> String {
         let ext = (name as NSString).pathExtension.lowercased()
         switch ext {
-        case "plist":              return "list.bullet.rectangle"
+        case "plist":                          return "list.bullet.rectangle"
         case "png", "jpg", "jpeg", "webp", "heic": return "photo"
-        case "mp4", "mov", "m4v": return "film"
-        case "mp3", "m4a", "aac": return "music.note"
-        case "pdf":                return "doc.richtext"
-        case "dylib", "so":        return "gear"
-        case "db", "sqlite":       return "cylinder"
-        case "bin", "img":         return "cpu"
-        default:                   return "doc"
+        case "mp4", "mov", "m4v":              return "film"
+        case "mp3", "m4a", "aac":              return "music.note"
+        case "pdf":                            return "doc.richtext"
+        case "dylib", "so":                    return "gear"
+        case "db", "sqlite":                   return "cylinder"
+        case "bin", "img":                     return "cpu"
+        default:                               return "doc"
         }
     }
 }
 
-// MARK: - File preview sheet (unchanged from original)
+// MARK: - File preview sheet
 
 struct FilePreviewSheet: View {
     let path:   String
@@ -608,9 +642,13 @@ struct FilePreviewSheet: View {
                         contentView(data: data).padding()
                     } else {
                         VStack(spacing: 12) {
-                            Image(systemName: "exclamationmark.triangle").font(.system(size: 40)).foregroundColor(.red)
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 40)).foregroundColor(.red)
                             Text("Failed to read file").font(.headline)
-                            Text(result.diagnostic).font(.system(size: 12, design: .monospaced)).foregroundColor(.secondary).multilineTextAlignment(.center)
+                            Text(result.diagnostic)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
                         }.padding(40)
                     }
                 }
@@ -618,7 +656,9 @@ struct FilePreviewSheet: View {
             .navigationTitle(filename)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
                 if let data {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         ShareLink(item: data, preview: SharePreview(filename))
@@ -633,20 +673,35 @@ struct FilePreviewSheet: View {
         HStack(spacing: 8) {
             Circle().fill(result.ok ? Color.green : Color.red).frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 2) {
-                Text(result.message).font(.system(size: 11, weight: .medium, design: .monospaced))
+                Text(result.message)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
                 if !result.diagnostic.isEmpty && result.diagnostic != result.message {
-                    Text(result.diagnostic).font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                    Text(result.diagnostic)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
                 }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                let c: Color = { switch result.tier {
-                    case .direct: return .green; case .vfs: return .blue
-                    case .remoteCall: return .orange; case .failed: return .red
-                }}()
-                Text(result.tier.rawValue).font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundColor(c)
-                if let proc = result.process { Text(proc).font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary) }
-                Text(String(format: "%.0fms", result.duration * 1000)).font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                let c: Color = {
+                    switch result.tier {
+                    case .direct:     return .green
+                    case .vfs:        return .blue
+                    case .remoteCall: return .orange
+                    case .failed:     return .red
+                    }
+                }()
+                Text(result.tier.rawValue)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundColor(c)
+                if let proc = result.process {
+                    Text(proc)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                Text(String(format: "%.0fms", result.duration * 1000))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
@@ -660,21 +715,35 @@ struct FilePreviewSheet: View {
             if let pl = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
                let xd = try? PropertyListSerialization.data(fromPropertyList: pl, format: .xml, options: 0),
                let xs = String(data: xd, encoding: .utf8) {
-                Text(xs).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                Text(xs)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             } else { fallbackText(data: data) }
-        case .text: fallbackText(data: data)
+        case .text:
+            fallbackText(data: data)
         case .hex:
-            Text(hexDump(data: data)).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-        case .auto: EmptyView()
+            Text(hexDump(data: data))
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .auto:
+            EmptyView()
         }
     }
 
     @ViewBuilder
     private func fallbackText(data: Data) -> some View {
         if let str = String(data: data, encoding: .utf8) {
-            Text(str).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Text(str)
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            Text(hexDump(data: data)).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Text(hexDump(data: data))
+                .font(.system(size: 11, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -686,9 +755,9 @@ struct FilePreviewSheet: View {
     }
 
     private func hexDump(data: Data) -> String {
-        let cap = min(data.count, 4096)
-        var lines: [String] = []
+        let cap   = min(data.count, 4096)
         let bytes = Array(data.prefix(cap))
+        var lines: [String] = []
         stride(from: 0, to: bytes.count, by: 16).forEach { i in
             let chunk = bytes[i..<min(i + 16, bytes.count)]
             let hex   = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -700,7 +769,7 @@ struct FilePreviewSheet: View {
     }
 }
 
-// MARK: - File picker wrapper (unchanged)
+// MARK: - File picker wrapper
 
 private struct RCFilePicker: UIViewControllerRepresentable {
     @Binding var data: Data?
