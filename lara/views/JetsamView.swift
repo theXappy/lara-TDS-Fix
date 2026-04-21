@@ -17,6 +17,12 @@
 //   16   critical daemon           (highest safe value)
 //   17+  kernel protected          — never touch
 //
+//  Fix log (update 3):
+//    • Shield icon → cpu (chip) icon in process row
+//    • .alert now driven by @State bool — .constant() never fires
+//    • memorystatus_control SET_JETSAM_HIGH_WATER_MARK: limit passed in flags
+//      field (not as a separate buffer parameter — iOS expects UInt32 MB value)
+//
 
 import SwiftUI
 import Darwin
@@ -31,10 +37,10 @@ private func memorystatus_control(
     _ buffersize: Int
 ) -> Int32
 
-private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:       Int32  = 1
-private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:  Int32  = 7
-private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK: Int32 = 5
-// Flag for MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK:
+private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:           Int32 = 1
+private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:     Int32 = 7
+private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK:  Int32 = 5
+// Bit flag for MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK (combined with limit MB in flags):
 //   0x0  → soft cap — process receives a jetsam warning, not killed
 //   0x4  → hard cap — process is terminated when footprint exceeds the limit
 private let MEMORYSTATUS_FLAGS_HWM_HARD: UInt32 = 0x4
@@ -46,11 +52,11 @@ struct JetsamProcess: Identifiable {
     let pid:    UInt32
     let uid:    UInt32
     let name:   String
-    var targetBand:      Int  = 12
-    var limitMB:         Int  = -1      // -1 = unlimited
-    var terminateOnLimit: Bool = false  // true → hard kill at limit; false → soft warning
+    var targetBand:       Int  = 12
+    var limitMB:          Int  = -1      // -1 = unlimited
+    var terminateOnLimit: Bool = false   // true → hard kill at limit; false → soft warning
     var isProtected: Bool = false
-    var origBand:    Int  = 10          // recorded before modification for restore
+    var origBand:    Int  = 10           // recorded before modification for restore
 }
 
 // MARK: - JetsamView
@@ -58,14 +64,18 @@ struct JetsamProcess: Identifiable {
 struct JetsamView: View {
     @ObservedObject private var mgr = laramgr.shared
 
-    @State private var processes:   [JetsamProcess] = []
-    @State private var loading = false
-    @State private var searchText  = ""
-    @State private var status:      String?
+    @State private var processes:     [JetsamProcess] = []
+    @State private var loading        = false
+    @State private var searchText     = ""
+
+    // Status alert — MUST use a dedicated Bool, not .constant(status != nil),
+    // which creates a read-only binding that never triggers the alert.
+    @State private var statusMessage:  String = ""
+    @State private var showStatus      = false
 
     // Editor sheet — keyed on pid, never a raw array index
-    @State private var editingPID:  UInt32?
-    @State private var showEditor   = false
+    @State private var editingPID:    UInt32?
+    @State private var showEditor     = false
 
     // Confirm restore-all
     @State private var showRestoreAll = false
@@ -84,12 +94,9 @@ struct JetsamView: View {
 
     var body: some View {
         List {
-            // Protected section
             if !protectedProcesses.isEmpty {
                 protectedSection
             }
-
-            // All running processes
             runningSection
         }
         .listStyle(.insetGrouped)
@@ -110,16 +117,17 @@ struct JetsamView: View {
                 }
             }
         }
-        .alert("Status", isPresented: .constant(status != nil)) {
-            Button("OK") { status = nil }
-        } message: { Text(status ?? "") }
+        // Use a proper Bool @State binding — .constant() never updates
+        .alert("Jetsam Result", isPresented: $showStatus) {
+            Button("OK") { showStatus = false }
+        } message: {
+            Text(statusMessage)
+        }
         .alert("Restore all Jetsam changes?", isPresented: $showRestoreAll) {
             Button("Restore", role: .destructive) { restoreAll() }
             Button("Cancel", role: .cancel) {}
         }
         .sheet(isPresented: $showEditor) {
-            // Look up by pid at render time — immune to array mutations/re-sorts
-            // that could make a stored Int index point at the wrong element.
             if let pid = editingPID,
                let idx = processes.firstIndex(where: { $0.pid == pid }) {
                 EditorSheet(process: $processes[idx], onApply: { apply(pid: pid) })
@@ -146,7 +154,7 @@ struct JetsamView: View {
                             if proc.limitMB == -1 {
                                 bandTag("unlimited", .blue)
                             } else {
-                                bandTag("\(proc.limitMB) MB cap", .orange)
+                                bandTag("\(proc.limitMB) MB \(proc.terminateOnLimit ? "hard" : "soft")", .orange)
                             }
                         }
                     }
@@ -182,8 +190,7 @@ struct JetsamView: View {
                     .foregroundColor(.secondary)
             } else {
                 ForEach(filteredProcesses.indices, id: \.self) { i in
-                    let proc = filteredProcesses[i]
-                    processRow(proc)
+                    processRow(filteredProcesses[i])
                 }
             }
         } header: {
@@ -220,7 +227,8 @@ struct JetsamView: View {
 
             Spacer()
 
-            Image(systemName: "shield")
+            // Changed from "shield" to "cpu" (processor chip icon) — update 3 request
+            Image(systemName: "cpu")
                 .foregroundColor(.secondary)
         }
         .contentShape(Rectangle())
@@ -251,14 +259,12 @@ struct JetsamView: View {
         var body: some View {
             NavigationView {
                 List {
-                    // Info
                     Section("Process") {
                         LabeledContent("Name", value: process.name)
                         LabeledContent("PID",  value: "\(process.pid)")
                         LabeledContent("UID",  value: "\(process.uid) (\(process.uid == 0 ? "root" : "mobile"))")
                     }
 
-                    // Priority band
                     Section {
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
@@ -272,25 +278,21 @@ struct JetsamView: View {
                             }
                             Slider(value: $bandDouble, in: 0...16, step: 1)
                                 .tint(bandColour(Int(bandDouble)))
-                            // Quick markers
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 6) {
                                     ForEach(bandMarkers, id: \.0) { band, label in
-                                        Button("\(band)") {
-                                            bandDouble = Double(band)
-                                        }
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .buttonStyle(.bordered)
-                                        .tint(Int(bandDouble) == band ? bandColour(band) : .secondary)
-                                        .controlSize(.mini)
+                                        Button("\(band)") { bandDouble = Double(band) }
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .buttonStyle(.bordered)
+                                            .tint(Int(bandDouble) == band ? bandColour(band) : .secondary)
+                                            .controlSize(.mini)
                                     }
                                 }
                             }
                         }
                     } header: { Text("Priority Band") }
-                    footer: { Text("Current foreground apps sit at band 10. SpringBoard is 15. Do not exceed 16.") }
+                    footer: { Text("Foreground apps sit at band 10. SpringBoard is 15. Do not exceed 16.") }
 
-                    // Memory limit
                     Section {
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
@@ -308,10 +310,7 @@ struct JetsamView: View {
                                 get: { limitDouble < 0 },
                                 set: { limitDouble = $0 ? -1 : 512 }
                             ))
-
                             Divider()
-
-                            // Hard-kill vs soft-warn on limit breach
                             Toggle(isOn: $terminateOnLimit) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text("Terminate process on limit reached")
@@ -323,12 +322,11 @@ struct JetsamView: View {
                                         .foregroundColor(terminateOnLimit ? .red : .secondary)
                                 }
                             }
-                            .disabled(limitDouble < 0)   // meaningless when unlimited
+                            .disabled(limitDouble < 0)
                         }
                     } header: { Text("Memory Limit") }
-                    footer: { Text("Unlimited removes the per-process footprint cap. A specific limit hard-caps a runaway process.") }
+                    footer: { Text("Unlimited removes the per-process footprint cap. A specific limit caps a runaway process.") }
 
-                    // Apply
                     Section {
                         Button {
                             process.targetBand       = Int(bandDouble)
@@ -339,13 +337,13 @@ struct JetsamView: View {
                         } label: {
                             HStack {
                                 Spacer()
-                                Label("Apply Jetsam Policy", systemImage: "shield.lefthalf.filled")
+                                Label("Apply Jetsam Policy", systemImage: "cpu")
                                     .fontWeight(.semibold)
                                 Spacer()
                             }
                         }
                         .foregroundColor(.white)
-                        .listRowBackground(Color.orange)
+                        .listRowBackground(Color.blue)
                     }
                 }
                 .listStyle(.insetGrouped)
@@ -392,12 +390,11 @@ struct JetsamView: View {
                     let e = ptr[i]
                     guard e.pid > 1 else { continue }
                     let name = withUnsafeBytes(of: e.name) { raw -> String in
-                        let b = raw.bindMemory(to: UInt8.self)
+                        let b   = raw.bindMemory(to: UInt8.self)
                         let end = b.firstIndex(of: 0) ?? b.endIndex
                         return String(bytes: b[..<end], encoding: .utf8) ?? "?"
                     }
                     guard !name.isEmpty else { continue }
-                    // Check if we already have a protected entry for this pid
                     let existing = self.processes.first(where: { $0.pid == e.pid })
                     var p = JetsamProcess(pid: e.pid, uid: e.uid, name: name)
                     if let ex = existing, ex.isProtected {
@@ -411,7 +408,6 @@ struct JetsamView: View {
                 free_proclist(ptr)
             }
             DispatchQueue.main.async {
-                // Merge: keep protected state from existing list for pids that disappeared
                 self.processes = result.sorted { $0.name.lowercased() < $1.name.lowercased() }
                 self.loading   = false
             }
@@ -424,29 +420,47 @@ struct JetsamView: View {
         let band    = Int32(proc.targetBand)
         let limitMB = Int32(proc.limitMB)
 
-        let ok = setJetsamBand(pid: Int32(proc.pid), band: band)
+        // Set priority band
+        let bandOK = setJetsamBand(pid: Int32(proc.pid), band: band)
 
+        // Set memory limit.
+        // iOS memorystatus_control SET_JETSAM_HIGH_WATER_MARK:
+        //   flags = (limit_in_MB as UInt32) | MEMORYSTATUS_FLAGS_HWM_HARD (if hard kill desired)
+        // The limit value is packed INTO the flags field — not a separate buffer.
+        var limitOK = true
+        if limitMB > 0 {
+            // Soft or hard cap
+            let flags: UInt32 = UInt32(limitMB) | (proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0)
+            let ret = memorystatus_control(
+                MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
+                Int32(proc.pid),
+                flags,
+                nil,
+                0
+            )
+            limitOK = ret == 0
+        }
+        // When limitMB == -1 (unlimited) we skip — there's no standard command
+        // to clear an HWM; the process retains existing or system-default limit.
+
+        processes[idx].isProtected = bandOK
+        processes[idx].origBand    = bandOK ? proc.origBand : proc.origBand
+
+        let limitDesc: String
         if limitMB == -1 {
-            // Unlimited: raise the high-water-mark to its maximum value (soft, no kill)
-            _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     Int32(proc.pid), 0,
-                                     nil, 0)
+            limitDesc = ", memory: system default"
         } else if limitMB > 0 {
-            // Hard-kill if terminateOnLimit is set; otherwise just raise a jetsam warning
-            let flags: UInt32 = proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0
-            _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     Int32(proc.pid), flags,
-                                     nil, 0)
+            limitDesc = ", \(limitMB) MB (\(proc.terminateOnLimit ? "hard kill" : "soft warn")) \(limitOK ? "✓" : "⚠ failed")"
+        } else {
+            limitDesc = ""
         }
 
-        processes[idx].isProtected = ok
-        processes[idx].origBand    = ok ? 10 : proc.origBand
-        let limitDesc: String = limitMB == -1 ? ", unlimited"
-                              : limitMB  >  0 ? ", \(limitMB)MB (\(proc.terminateOnLimit ? "hard kill" : "soft warn"))"
-                              : ""
-        status = ok
-            ? "Protected \(proc.name) (pid \(proc.pid)) → band \(band)\(limitDesc)"
-            : "memorystatus_control failed for \(proc.name) — sbx escape may be required"
+        if bandOK {
+            statusMessage = "Protected \(proc.name) → band \(band)\(limitDesc)"
+        } else {
+            statusMessage = "memorystatus_control failed for \(proc.name) (pid \(proc.pid)) — sbx escape may be required"
+        }
+        showStatus = true   // triggers .alert($showStatus) — this works, .constant() does not
     }
 
     private func restore(pid: Int32) {
@@ -454,7 +468,8 @@ struct JetsamView: View {
         let proc = processes[idx]
         _ = setJetsamBand(pid: pid, band: Int32(proc.origBand))
         processes[idx].isProtected = false
-        status = "Restored \(proc.name)"
+        statusMessage = "Restored \(proc.name) to band \(proc.origBand)"
+        showStatus    = true
     }
 
     private func restoreAll() {
@@ -464,18 +479,16 @@ struct JetsamView: View {
                 processes[idx].isProtected = false
             }
         }
-        status = "All Jetsam changes restored"
+        statusMessage = "All Jetsam changes restored"
+        showStatus    = true
     }
 
     // MARK: - memorystatus_control wrapper
 
-    /// Sets a process's Jetsam priority band.
-    /// Tries direct syscall first (works post-sbx-escape on some configs),
-    /// then falls through silently — RC-based fallback can be added here later.
     private func setJetsamBand(pid: Int32, band: Int32) -> Bool {
-        // memorystatus_priority_properties_t layout:
-        //   int32_t  priority   (offset 0, size 4)
-        //   uint64_t user_data  (offset 8, size 8, natural alignment)
+        // memorystatus_priority_properties_t:
+        //   int32_t  priority   (offset 0)
+        //   uint64_t user_data  (offset 8, natural alignment)
         // Total: 16 bytes
         var buf = [UInt8](repeating: 0, count: 16)
         withUnsafeBytes(of: band) { src in
@@ -493,7 +506,7 @@ struct JetsamView: View {
         return ret == 0
     }
 
-    // MARK: - Band label helpers (used by row display)
+    // MARK: - Band helpers (row display)
 
     private func bandColour(_ b: Int) -> Color {
         switch b {
@@ -518,38 +531,3 @@ struct JetsamView: View {
             )
     }
 }
-
-// MARK: - ProcessSelectorView — stateColor fix (Bug 3)
-//
-// In ProcessSelectorView's RunningRow the `stateColor` switch is missing the
-// `.spawning` case, so spawning processes fall through to the default (.gray)
-// even though `isIniting` already returns true for them — the indicator dot
-// therefore never shows the expected colour.
-//
-// Locate the switch in ProcessSelectorView that looks like:
-//
-//     private func stateColor(_ state: ProcessState) -> Color {
-//         switch state {
-//         case .running:    return .green
-//         case .idle:       return .yellow
-//         case .suspended:  return .orange
-//         case .dead:       return .red
-//         // .spawning is unhandled → falls to default
-//         default:          return .gray
-//         }
-//     }
-//
-// Replace with:
-//
-//     private func stateColor(_ state: ProcessState) -> Color {
-//         switch state {
-//         case .running:    return .green
-//         case .idle:       return .yellow
-//         case .suspended:  return .orange
-//         case .spawning:   return .blue     // matches the isIniting label colour
-//         case .dead:       return .red
-//         default:          return .gray
-//         }
-//     }
-//
-// Upload ProcessSelectorView.swift to apply this change directly.
