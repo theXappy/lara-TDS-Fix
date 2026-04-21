@@ -31,9 +31,13 @@ private func memorystatus_control(
     _ buffersize: Int
 ) -> Int32
 
-private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:      Int32 = 1
-private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES: Int32 = 7
+private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:       Int32  = 1
+private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:  Int32  = 7
 private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK: Int32 = 5
+// Flag for MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK:
+//   0x0  → soft cap — process receives a jetsam warning, not killed
+//   0x4  → hard cap — process is terminated when footprint exceeds the limit
+private let MEMORYSTATUS_FLAGS_HWM_HARD: UInt32 = 0x4
 
 // MARK: - Data model
 
@@ -42,10 +46,11 @@ struct JetsamProcess: Identifiable {
     let pid:    UInt32
     let uid:    UInt32
     let name:   String
-    var targetBand:  Int  = 12
-    var limitMB:     Int  = -1      // -1 = unlimited
+    var targetBand:      Int  = 12
+    var limitMB:         Int  = -1      // -1 = unlimited
+    var terminateOnLimit: Bool = false  // true → hard kill at limit; false → soft warning
     var isProtected: Bool = false
-    var origBand:    Int  = 10      // recorded before modification for restore
+    var origBand:    Int  = 10          // recorded before modification for restore
 }
 
 // MARK: - JetsamView
@@ -58,8 +63,8 @@ struct JetsamView: View {
     @State private var searchText  = ""
     @State private var status:      String?
 
-    // Editor sheet
-    @State private var editingIdx:  Int?
+    // Editor sheet — keyed on pid, never a raw array index
+    @State private var editingPID:  UInt32?
     @State private var showEditor   = false
 
     // Confirm restore-all
@@ -113,8 +118,11 @@ struct JetsamView: View {
             Button("Cancel", role: .cancel) {}
         }
         .sheet(isPresented: $showEditor) {
-            if let idx = editingIdx {
-                EditorSheet(process: $processes[idx], onApply: { apply(idx: idx) })
+            // Look up by pid at render time — immune to array mutations/re-sorts
+            // that could make a stored Int index point at the wrong element.
+            if let pid = editingPID,
+               let idx = processes.firstIndex(where: { $0.pid == pid }) {
+                EditorSheet(process: $processes[idx], onApply: { apply(pid: pid) })
             }
         }
         .onAppear { refresh() }
@@ -180,7 +188,9 @@ struct JetsamView: View {
             }
         } header: {
             HStack {
-                Text("Running (\(processes.count))")
+                Text(searchText.isEmpty
+                     ? "Running (\(processes.count))"
+                     : "Running (\(filteredProcesses.count) of \(processes.count))")
                 Spacer()
                 Text("R = root  M = mobile")
                     .font(.system(size: 9, design: .monospaced))
@@ -215,11 +225,8 @@ struct JetsamView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            // Find index in the full processes array
-            if let idx = processes.firstIndex(where: { $0.pid == proc.pid }) {
-                editingIdx = idx
-                showEditor = true
-            }
+            editingPID = proc.pid
+            showEditor = true
         }
         .disabled(!mgr.dsready && !mgr.sbxready)
     }
@@ -231,8 +238,9 @@ struct JetsamView: View {
         let onApply: () -> Void
         @Environment(\.dismiss) private var dismiss
 
-        @State private var bandDouble:  Double = 12
-        @State private var limitDouble: Double = -1
+        @State private var bandDouble:       Double = 12
+        @State private var limitDouble:      Double = -1
+        @State private var terminateOnLimit: Bool   = false
 
         private let bandMarkers: [(Int, String)] = [
             (0,  "idle"), (4, "bg suspend"), (5, "bg audio"),
@@ -300,6 +308,22 @@ struct JetsamView: View {
                                 get: { limitDouble < 0 },
                                 set: { limitDouble = $0 ? -1 : 512 }
                             ))
+
+                            Divider()
+
+                            // Hard-kill vs soft-warn on limit breach
+                            Toggle(isOn: $terminateOnLimit) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Terminate process on limit reached")
+                                        .font(.system(.body, design: .monospaced))
+                                    Text(terminateOnLimit
+                                         ? "Hard cap — process is killed when footprint exceeds limit"
+                                         : "Soft cap — process receives a jetsam warning, not killed")
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(terminateOnLimit ? .red : .secondary)
+                                }
+                            }
+                            .disabled(limitDouble < 0)   // meaningless when unlimited
                         }
                     } header: { Text("Memory Limit") }
                     footer: { Text("Unlimited removes the per-process footprint cap. A specific limit hard-caps a runaway process.") }
@@ -307,8 +331,9 @@ struct JetsamView: View {
                     // Apply
                     Section {
                         Button {
-                            process.targetBand = Int(bandDouble)
-                            process.limitMB    = Int(limitDouble)
+                            process.targetBand       = Int(bandDouble)
+                            process.limitMB          = Int(limitDouble)
+                            process.terminateOnLimit = terminateOnLimit
                             onApply()
                             dismiss()
                         } label: {
@@ -332,8 +357,9 @@ struct JetsamView: View {
                     }
                 }
                 .onAppear {
-                    bandDouble  = Double(process.targetBand)
-                    limitDouble = Double(process.limitMB)
+                    bandDouble       = Double(process.targetBand)
+                    limitDouble      = Double(process.limitMB)
+                    terminateOnLimit = process.terminateOnLimit
                 }
             }
         }
@@ -392,26 +418,34 @@ struct JetsamView: View {
         }
     }
 
-    private func apply(idx: Int) {
-        let proc = processes[idx]
+    private func apply(pid: UInt32) {
+        guard let idx = processes.firstIndex(where: { $0.pid == pid }) else { return }
+        let proc    = processes[idx]
         let band    = Int32(proc.targetBand)
         let limitMB = Int32(proc.limitMB)
 
-        var ok = setJetsamBand(pid: Int32(proc.pid), band: band)
+        let ok = setJetsamBand(pid: Int32(proc.pid), band: band)
 
         if limitMB == -1 {
-            // Unlimited: use a very large value for the high-water-mark command
+            // Unlimited: raise the high-water-mark to its maximum value (soft, no kill)
             _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     Int32(proc.pid), UInt32(bitPattern: Int32.max), nil, 0)
+                                     Int32(proc.pid), 0,
+                                     nil, 0)
         } else if limitMB > 0 {
+            // Hard-kill if terminateOnLimit is set; otherwise just raise a jetsam warning
+            let flags: UInt32 = proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0
             _ = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                                     Int32(proc.pid), UInt32(bitPattern: limitMB), nil, 0)
+                                     Int32(proc.pid), flags,
+                                     nil, 0)
         }
 
         processes[idx].isProtected = ok
-        processes[idx].origBand    = ok ? 10 : proc.origBand  // conservative default
+        processes[idx].origBand    = ok ? 10 : proc.origBand
+        let limitDesc: String = limitMB == -1 ? ", unlimited"
+                              : limitMB  >  0 ? ", \(limitMB)MB (\(proc.terminateOnLimit ? "hard kill" : "soft warn"))"
+                              : ""
         status = ok
-            ? "Protected \(proc.name) (pid \(proc.pid)) → band \(band)\(limitMB == -1 ? ", unlimited" : limitMB > 0 ? ", \(limitMB)MB" : "")"
+            ? "Protected \(proc.name) (pid \(proc.pid)) → band \(band)\(limitDesc)"
             : "memorystatus_control failed for \(proc.name) — sbx escape may be required"
     }
 
@@ -484,3 +518,38 @@ struct JetsamView: View {
             )
     }
 }
+
+// MARK: - ProcessSelectorView — stateColor fix (Bug 3)
+//
+// In ProcessSelectorView's RunningRow the `stateColor` switch is missing the
+// `.spawning` case, so spawning processes fall through to the default (.gray)
+// even though `isIniting` already returns true for them — the indicator dot
+// therefore never shows the expected colour.
+//
+// Locate the switch in ProcessSelectorView that looks like:
+//
+//     private func stateColor(_ state: ProcessState) -> Color {
+//         switch state {
+//         case .running:    return .green
+//         case .idle:       return .yellow
+//         case .suspended:  return .orange
+//         case .dead:       return .red
+//         // .spawning is unhandled → falls to default
+//         default:          return .gray
+//         }
+//     }
+//
+// Replace with:
+//
+//     private func stateColor(_ state: ProcessState) -> Color {
+//         switch state {
+//         case .running:    return .green
+//         case .idle:       return .yellow
+//         case .suspended:  return .orange
+//         case .spawning:   return .blue     // matches the isIniting label colour
+//         case .dead:       return .red
+//         default:          return .gray
+//         }
+//     }
+//
+// Upload ProcessSelectorView.swift to apply this change directly.
