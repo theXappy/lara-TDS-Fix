@@ -34,7 +34,7 @@ private let PROC_PIDTASKINFO_FLAVOR: Int32 = 4
 
 /// Mirrors the layout of struct proc_taskinfo from <proc_info.h>.
 /// Total size: 6 × UInt64 (48) + 12 × Int32 (48) = 96 bytes.
-private struct ProcTaskInfo {
+fileprivate struct ProcTaskInfo {
     var pti_virtual_size:       UInt64 = 0   // virtual memory (bytes)
     var pti_resident_size:      UInt64 = 0   // resident memory (bytes)
     var pti_total_user:         UInt64 = 0
