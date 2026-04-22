@@ -511,11 +511,39 @@ final class RemoteFileIO: ObservableObject {
     // MARK: - Directory listing
 
     /// List directory contents using the best available method.
-    /// Chain: VFS → FileManager → RC opendir/readdir → empty.
+    ///
+    /// We try the given path first.  If every tier fails, we flip the /private
+    /// prefix and retry — iOS symlinks mean /var and /private/var resolve to the
+    /// same physical location but VFS may have indexed the entries under whichever
+    /// form it first saw (usually the un-prefixed /var/... form).
     func listDir(path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String) {
+        if let result = _listDirAtPath(path) { return result }
+
+        // Build alternate: toggle /private prefix.
+        let alt: String?
+        if path.hasPrefix("/private/") {
+            // /private/var/... → /var/...
+            alt = String(path.dropFirst(8))
+        } else if path != "/" && !path.hasPrefix("/private") {
+            // /var/... → /private/var/...
+            alt = "/private" + path
+        } else {
+            alt = nil
+        }
+
+        if let alt, let result = _listDirAtPath(alt) { return result }
+        return ([], "failed")
+    }
+
+    /// Single-path listing attempt.  Returns nil if every tier failed (nil from
+    /// VFS, throw from FM, and nil from every RC candidate), signalling the caller
+    /// to retry with an alternate path.
+    private func _listDirAtPath(_ path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String)? {
         let fm = FileManager.default
 
         // Tier 1: VFS
+        // nil  → VFS can't access this path (caller should try alternate)
+        // []   → valid empty directory (return it, don't fall through)
         if mgr.vfsready, let items = mgr.vfslistdir(path: path) {
             let enriched = items.map { item -> (String, Bool, Int64) in
                 let size = item.isDir ? Int64(-1)
@@ -543,20 +571,15 @@ final class RemoteFileIO: ObservableObject {
             if let items = rcListDir(path: path, process: proc) {
                 let enriched: [(String, Bool, Int64)] = items.map { item in
                     let full = (path == "/" ? "" : path) + "/" + item.name
-                    // Size via FileManager if accessible; otherwise -1
-                    let size: Int64
-                    if item.isDir {
-                        size = -1
-                    } else {
-                        size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? Int64(-1)
-                    }
+                    let size: Int64 = item.isDir ? -1
+                        : ((try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1)
                     return (item.name, item.isDir, size)
                 }
                 return (enriched, "rc:\(proc)")
             }
         }
 
-        return ([], "failed")
+        return nil  // All tiers failed for this path
     }
 
     // MARK: - RC directory listing primitive
