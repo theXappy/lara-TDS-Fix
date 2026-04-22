@@ -11,7 +11,6 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
-import Darwin
 
 // MARK: - FileManagerView
 
@@ -50,9 +49,12 @@ struct FileManagerView: View {
     // ghost second tab bar at the bottom of the screen.
     @State private var showLaraFM = false
 
-    // Cancellable directory load — cancelled when user navigates away,
-    // preventing the old result from clobbering a newer path's listing.
-    @State private var currentLoadWorkItem: DispatchWorkItem?
+    // Monotonically-increasing generation counter: each loadEntries() call
+    // stamps a new value; in-flight completions that see a stale gen bail out.
+    // Using a plain Int avoids the DispatchWorkItem capture-of-struct-copy bug
+    // where self.currentLoadWorkItem always pointed to the CURRENT item (not the
+    // cancelled one), so isCancelled was always false and the guard never fired.
+    @State private var loadGeneration: Int = 0
 
     // Delete
     @State private var deleteTarget:   String?
@@ -491,36 +493,51 @@ struct FileManagerView: View {
     // MARK: - Navigation and loading
 
     private func navigate(to newPath: String) {
-        // Resolve symlinks so tapping "private" (which is /private → /)
-        // doesn't build /private/private/private/... forever.
-        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        let canonical = (Darwin.realpath(newPath, &buf) != nil) ? String(cString: buf) : newPath
-        path = canonical
+        // IMPORTANT: do NOT use realpath() here.
+        //
+        // realpath("/var") resolves to "/private/var" because /var is a symlink
+        // on iOS. The VFS layer indexes inodes under the symlinked form (/var/...),
+        // so passing the canonical /private/var form causes vfslistdir to return
+        // nil, FM then fails (sandbox), and the listing appears empty or as root.
+        //
+        // URL.standardized collapses ".." and "//" without following symlinks —
+        // which is all we need for safe path normalisation.
+        // listDir() in RemoteFileIO internally retries both /var and /private/var.
+        var normalized = URL(fileURLWithPath: newPath).standardized.path
+        // Safety net: strip any doubled /private prefix (/private/private/... → /private/...)
+        while normalized.hasPrefix("/private/private") {
+            normalized = "/private" + String(normalized.dropFirst("/private/private".count))
+        }
+        path = normalized.isEmpty ? "/" : normalized
         loadEntries()
     }
 
     private func loadEntries() {
-        // Cancel any in-flight load before starting a new one.
-        // This prevents a slow RC call from clobbering a subsequent navigation.
-        currentLoadWorkItem?.cancel()
-
-        let targetPath = path
+        // Stamp this load with the current generation.  Any in-flight load from
+        // a previous navigation sees a different gen value and discards its result.
+        //
+        // We can NOT use DispatchWorkItem.isCancelled for this: FileManagerView is
+        // a *struct* and closures capture self by value.  self.currentLoadWorkItem
+        // in the captured copy always pointed to the item that was just created
+        // (not the one that was cancelled), so isCancelled was always false and the
+        // guard never fired — stale results from older paths would overwrite newer ones.
+        loadGeneration &+= 1
+        let gen         = loadGeneration
+        let targetPath  = path
         loading    = true
         entries    = []
         listSource = ""
 
-        let item = DispatchWorkItem {
+        DispatchQueue.global(qos: .userInitiated).async {
             let (e, src) = self.rcio.listDir(path: targetPath)
             DispatchQueue.main.async {
-                // Discard stale results if the path changed or the task was cancelled
-                guard self.path == targetPath, !(self.currentLoadWorkItem?.isCancelled ?? true) else { return }
+                // Discard if a newer navigation has already started.
+                guard self.loadGeneration == gen else { return }
                 self.entries    = e
                 self.listSource = src
                 self.loading    = false
             }
         }
-        currentLoadWorkItem = item
-        DispatchQueue.global(qos: .userInitiated).async(execute: item)
     }
 
     // MARK: - File operations
