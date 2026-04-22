@@ -430,6 +430,10 @@ struct ContentView: View {
                     } header: {
                         Text("RemoteCall")
                     } footer: {
+                        if let error = mgr.sbProc?.lastError {
+                            Text("RemoteCall error: \(error)")
+                                .foregroundColor(.red)
+                        }
                         if isdebugged() {
                             Text("Not available when a debugger is attached.")
                         }

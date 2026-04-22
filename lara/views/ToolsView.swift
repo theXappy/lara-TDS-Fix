@@ -74,10 +74,8 @@ struct ToolsView: View {
             }
             
             Section {
-                Button {
+                Button("Respring") {
                     mgr.respring()
-                } label: {
-                    Text("Respring")
                 }
                 
                 HStack {

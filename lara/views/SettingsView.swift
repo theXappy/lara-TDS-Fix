@@ -496,11 +496,12 @@ struct SettingsView: View {
                         Spacer()
                     }
                     .onTapGesture {
-                        if let url = URL(string: "https://github.com/neonmodder123"),
+                        if let url = URL(string: "https://github.com/skadz108"),
                            UIApplication.shared.canOpenURL(url) {
                             UIApplication.shared.open(url)
                         }
                     }
+
                 } header: {
                     Text("Credits")
                 }
