@@ -22,11 +22,16 @@
 //    5. all other currently-ready pool processes
 //    6. fail with full diagnostic
 //
-//  Directory listing chain (VFS/SBX first per user spec):
-//    1. VFS listdir           — SBX/VFS layer, same as Lara FM
-//    2. FileManager (post-sbx) — direct IO
-//    3. RC opendir/readdir    — privilege-escalated, reaches protected dirs
+//  Directory listing chain (FileManager/SBX first — VFS has stale namecache bug):
+//    1. FileManager (post-sbx)    — most reliable, same as Lara FM SBX mode
+//    2. VFS listdir               — kernel namecache; change-detection discards stale results
+//    3. RC opendir/readdir        — privilege-escalated, reaches MAC-protected dirs
 //    4. empty + "failed"
+//
+//  VFS stale-namecache detection:
+//    VFS can silently return the PREVIOUS directory's entries for any new path.
+//    We track the last accepted VFS listing (path + entry names).  If a new
+//    path produces identical entry names, the result is stale — discard it.
 //
 //  Known iOS version differences:
 //    iOS ≤16:  backup daemon = "mobile_backup_agent"
@@ -36,7 +41,6 @@
 import Foundation
 import Combine
 import Darwin
-import SwiftUI
 
 // MARK: - Diagnostics types
 
@@ -146,6 +150,12 @@ final class RemoteFileIO: ObservableObject {
 
     private let mgr      = laramgr.shared
     private let poolLock  = NSLock()
+
+    // VFS listing change-detection: stores the path and entry names from the
+    // last accepted VFS listing.  If VFS returns the exact same set of names
+    // for a DIFFERENT path, it's returning stale namecache data — discard it.
+    private var lastVFSPath:  String?
+    private var lastVFSNames: Set<String>?
 
     // UserDefaults key for bookmarks
     private static let bookmarksKey = "rcfm_bookmarks"
@@ -635,20 +645,24 @@ final class RemoteFileIO: ObservableObject {
         return ([], "failed")
     }
 
+    /// Single-path listing attempt.
+    ///
+    /// Tier order for directory listing:
+    ///   1. FileManager (post-sbx-escape) — most reliable, same as Lara FM in SBX mode
+    ///   2. VFS — kernel namecache walk; uses **change-detection** to catch the stale
+    ///      namecache bug (VFS returns the previous directory's entries for any new path).
+    ///      Compares current VFS result names against the last accepted VFS listing — if
+    ///      identical names but different path, the result is stale and gets discarded.
+    ///   3. RC opendir/readdir — privilege-escalated, reaches MAC-protected dirs
+    ///
+    /// Returns nil if every tier failed for this path, signalling the caller to retry
+    /// with the /private-toggled alternate path.
     private func _listDirAtPath(_ path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String)? {
         let fm = FileManager.default
 
-        // Tier 1: VFS (same layer as Lara FM — try first per user spec)
-        if mgr.vfsready, let items = mgr.vfslistdir(path: path) {
-            let enriched = items.map { item -> (String, Bool, Int64) in
-                let size = item.isDir ? Int64(-1)
-                                      : mgr.vfssize(path: path + "/" + item.name)
-                return (item.name, item.isDir, size)
-            }
-            return (enriched, "vfs")
-        }
-
-        // Tier 2: FileManager (post-sbx-escape, direct IO)
+        // ── Tier 1: FileManager (post-sbx-escape, direct IO) ───────────────
+        // This is the same path SantanderView uses in SBX mode.  Most reliable
+        // for any directory the sandbox escape grants access to.
         if let names = try? fm.contentsOfDirectory(atPath: path) {
             let entries: [(String, Bool, Int64)] = names.sorted().map { name in
                 let full = (path == "/" ? "" : path) + "/" + name
@@ -657,10 +671,58 @@ final class RemoteFileIO: ObservableObject {
                 let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? Int64(-1)
                 return (name, isDir.boolValue, size)
             }
+            dbg("  tier1 filemanager ok: \(entries.count) entries for \(path)")
             return (entries, "filemanager")
         }
+        dbg("  tier1 filemanager failed for \(path)")
 
-        // Tier 3: RC opendir/readdir — privilege-escalated, reaches protected dirs
+        // ── Tier 2: VFS ────────────────────────────────────────────────────
+        // VFS walks the kernel namecache.  Known bug: stale namecache entries
+        // can cause vfs_listdir to return the PREVIOUS directory's entries
+        // (often root) regardless of the path you ask for.
+        //
+        // Change-detection sanity check:
+        //   Compare the names VFS returned against the last accepted VFS
+        //   listing.  If the names are identical but the path is different,
+        //   VFS is returning stale data — discard and fall through to RC.
+        //   This catches ALL stale-namecache cases, not just root misfire.
+        if mgr.vfsready, let items = mgr.vfslistdir(path: path) {
+            let currentNames = Set(items.map { $0.name })
+            let isStale: Bool = {
+                // Different path, but identical entries → stale
+                guard let prevPath = lastVFSPath, let prevNames = lastVFSNames else {
+                    return false   // first listing ever — nothing to compare against
+                }
+                if prevPath == path {
+                    return false   // same path re-listed (e.g. pull-to-refresh) — fine
+                }
+                // If the name sets match exactly, VFS didn't actually resolve
+                // the new path — it returned cached entries from prevPath.
+                return currentNames == prevNames
+            }()
+
+            if isStale {
+                dbg("  tier2 vfs DISCARDED: entries identical to previous listing at '\(lastVFSPath ?? "?")' — stale namecache for \(path)")
+            } else {
+                // Accept this listing and update the tracking state
+                lastVFSPath  = path
+                lastVFSNames = currentNames
+
+                let enriched = items.map { item -> (String, Bool, Int64) in
+                    let size = item.isDir ? Int64(-1)
+                                          : mgr.vfssize(path: path + "/" + item.name)
+                    return (item.name, item.isDir, size)
+                }
+                dbg("  tier2 vfs ok: \(enriched.count) entries for \(path)")
+                return (enriched, "vfs")
+            }
+        } else {
+            dbg("  tier2 vfs \(mgr.vfsready ? "returned nil" : "not ready") for \(path)")
+        }
+
+        // ── Tier 3: RC opendir/readdir ─────────────────────────────────────
+        // Privilege-escalated listing via hijacked process.  Reaches dirs that
+        // are MAC-protected (Keychains, DPLA, MobileIdentityData, etc.).
         let candidates = buildCandidates(for: path)
         for proc in candidates {
             if let items = rcListDir(path: path, process: proc) {
@@ -670,9 +732,11 @@ final class RemoteFileIO: ObservableObject {
                         : ((try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1)
                     return (item.name, item.isDir, size)
                 }
+                dbg("  tier3 rc:\(proc) ok: \(enriched.count) entries for \(path)")
                 return (enriched, "rc:\(proc)")
             }
         }
+        dbg("  all tiers failed for \(path)")
 
         return nil  // All tiers failed for this path
     }
