@@ -434,8 +434,8 @@ struct JetsamMultiplier {
         }
 
         // Read current values
-        let activeOrig   = Int32(bitPattern: mgr.kcread32(taskAddr + off_task_memlimit_active))
-        let inactiveOrig = Int32(bitPattern: mgr.kcread32(taskAddr + off_task_memlimit_inactive))
+        let activeOrig   = Int32(bitPattern: mgr.kread32(taskAddr + off_task_memlimit_active))
+        let inactiveOrig = Int32(bitPattern: mgr.kread32(taskAddr + off_task_memlimit_inactive))
 
         // Multiply
         let newActive   = activeOrig > 0 ? activeOrig * multiplier : activeOrig
