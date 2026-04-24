@@ -442,8 +442,8 @@ struct JetsamMultiplier {
         let newInactive = inactiveOrig > 0 ? inactiveOrig * multiplier : inactiveOrig
 
         // Write back
-        mgr.kcwrite32(taskAddr + off_task_memlimit_active,   value: UInt32(bitPattern: newActive))
-        mgr.kcwrite32(taskAddr + off_task_memlimit_inactive, value: UInt32(bitPattern: newInactive))
+        mgr.kwrite32(taskAddr + off_task_memlimit_active,   value: UInt32(bitPattern: newActive))
+        mgr.kwrite32(taskAddr + off_task_memlimit_inactive, value: UInt32(bitPattern: newInactive))
 
         return MultiplierResult(
             ok: true, approach: "krw",
