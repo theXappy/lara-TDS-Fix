@@ -70,7 +70,11 @@ struct LGView: View {
                                 .foregroundColor(.red)
                         }
                     }
-                    
+                    Button() {
+                        load()
+                    } label: {
+                        Text("Refresh plist")
+                    }
                     Button() {
                         apply()
                     } label: {
@@ -78,7 +82,7 @@ struct LGView: View {
                     }
                     .disabled(!valid)
                 } header: {
-                    Text("Apply")
+                    Text("Actions")
                 } footer: {
                     Text("Use at your own risk. Always keep a backup of \"/var/Managed Preferences/.GlobalPreferences.plist\" somewhere safe.")
                 }
@@ -125,8 +129,8 @@ struct LGView: View {
                 target: path,
                 data: data
             )
-            
-            if result.ok {
+            load()
+            if result.ok && validate(gp) {
                 mgr.logmsg("overwrote GlobalPreferences.plist at \(path)")
                 alert = "Applied plist, respring to see changes."
             } else {
