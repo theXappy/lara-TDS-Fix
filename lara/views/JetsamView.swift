@@ -164,6 +164,23 @@ struct JetsamMultiplier {
     /// Apply the jetsam multiplier to a single process, trying all approaches
     /// in fallback order until one succeeds.
     static func applyMultiplier(pid: Int32, multiplier: Int32, mgr: laramgr? = nil) -> MultiplierResult {
+        // ── Approach 0: task_set_phys_footprint_limit via RC ─────────────
+        // This is the only approach that raises the VM ledger hard cap —
+        // the mechanism that actually kills memory-heavy apps at a consistent
+        // threshold (e.g. MelonX at 2.15 GB).  memorystatus_control alone
+        // only adjusts the jetsam watchdog, which fires at variable thresholds
+        // under pressure and never exceeds the ledger cap anyway.
+        //
+        // We RC into configd (root uid) to call:
+        //   task_for_pid(mach_task_self(), target_pid, &task_port)
+        //   task_set_phys_footprint_limit(task_port, new_limit_mb, nil)
+        //
+        // As a simpler fallback we also try MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT
+        // (cmd 6) via syscall — that internally calls task_set_phys_footprint_limit
+        // for the target, hitting both ledger and jetsam in one kernel call.
+        let r0 = viaFootprintLimit(pid: pid, multiplier: multiplier)
+        if r0.ok { return r0 }
+
         // Approach 1: direct memorystatus_control from lara's process
         let r1 = viaDirectMemstatus(pid: pid, multiplier: multiplier)
         if r1.ok { return r1 }
@@ -173,7 +190,6 @@ struct JetsamMultiplier {
         if r2.ok { return r2 }
 
         // Approach 3: RC into any other ready root-uid process
-        let rcio = RemoteFileIO.shared
         let rootProcs = ["SpringBoard", "securityd", "mediaserverd",
                          RemoteFileIO.backupDaemonName]
         for proc in rootProcs {
@@ -182,15 +198,152 @@ struct JetsamMultiplier {
         }
 
         // Approach 4: RC using syscall() — call memorystatus_control by syscall number
-        // This bypasses the C wrapper and can work from any hijacked process context
         let r4 = viaSyscallRC(pid: pid, multiplier: multiplier)
         if r4.ok { return r4 }
 
-        // Approach 5: Direct KRW kernel write
+        // Approach 5: Direct KRW kernel write (requires offsets)
         let r5 = viaKRW(pid: pid, multiplier: multiplier)
         if r5.ok { return r5 }
 
         return .failure("all approaches failed for pid \(pid)")
+    }
+
+    // ── Approach 0: task_set_phys_footprint_limit via RC ─────────────────
+    //
+    // This is the only approach that raises the VM ledger hard cap.
+    //
+    // Strategy A: task_for_pid → task_set_phys_footprint_limit
+    //   RC into configd (uid 0, has task_for_pid entitlement).
+    //   Call task_for_pid(mach_task_self(), target_pid, buf) to get the target
+    //   task port into remote memory, then call task_set_phys_footprint_limit
+    //   on that port with the desired limit.
+    //
+    // Strategy B: MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT (cmd 6) via syscall
+    //   Simpler — cmd 6 internally calls task_set_phys_footprint_limit_internal
+    //   for the target pid, hitting both the ledger cap and the jetsam memlimit
+    //   in a single kernel call.  Requires com.apple.private.memorystatus on the
+    //   calling process; configd has it.
+    //
+    // The new limit is: currentLimit * multiplier, capped at kFootprintCapMB.
+    // We read the current limit via task_get_phys_footprint_limit before writing.
+
+    // Hard ceiling — don't set footprint limits above this regardless of multiplier.
+    // iPhone 13 has 4 GB physical RAM; leave ~1 GB headroom for kernel + other procs.
+    private static let kFootprintCapMB: Int32 = 3072   // 3 GB
+
+    private static func viaFootprintLimit(pid: Int32, multiplier: Int32) -> MultiplierResult {
+        let rcio = RemoteFileIO.shared
+        let candidates = ["configd", "SpringBoard", "securityd"]
+
+        for procName in candidates {
+            guard let rc = rcio.rcProc(for: procName) else { continue }
+            let trojan = rc.trojanMem
+            guard trojan != 0 else { continue }
+
+            // ── Strategy A: task_for_pid → task_set_phys_footprint_limit ──────
+
+            // task_for_pid(mach_task_self_(), target_pid, &task_port_out)
+            // Writes the mach_port_t (4 bytes) into trojan+0.
+            var zero32: UInt32 = 0
+            rc.remote_write(trojan, from: &zero32, size: UInt64(4))
+
+            let tfpRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc,
+                name: "task_for_pid",
+                args: [
+                    rcio.callIn(rc: rc, name: "mach_task_self_", args: []), // task_t self
+                    UInt64(bitPattern: Int64(pid)),                          // target pid
+                    trojan                                                   // mach_port_t *
+                ]) & 0xFFFFFFFF))
+
+            if tfpRet == 0 /* KERN_SUCCESS */ {
+                // Read back the port name (4-byte mach_port_t)
+                var portVal: UInt32 = 0
+                _ = rc.remoteRead(trojan, to: &portVal, size: UInt64(4))
+
+                if portVal != 0 {
+                    // Read current limit via task_get_phys_footprint_limit
+                    // int task_get_phys_footprint_limit(task_t task, int *limit_mb)
+                    // Store result at trojan+8
+                    var curLimitSlot: Int32 = 0
+                    rc.remote_write(trojan + 8, from: &curLimitSlot, size: UInt64(4))
+                    _ = rcio.callIn(rc: rc, name: "task_get_phys_footprint_limit",
+                                    args: [UInt64(portVal), trojan + 8])
+
+                    var curLimit: Int32 = 0
+                    _ = rc.remoteRead(trojan + 8, to: &curLimit, size: UInt64(4))
+
+                    // If current limit is 0 or negative, fall back to a sensible default
+                    let baseLimit: Int32 = curLimit > 0 ? curLimit : 1500
+                    var newLimit = baseLimit * multiplier
+                    if newLimit > kFootprintCapMB { newLimit = kFootprintCapMB }
+
+                    // task_set_phys_footprint_limit(task_port, new_limit_mb, nil)
+                    // Returns kern_return_t (0 = success)
+                    let setRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc,
+                        name: "task_set_phys_footprint_limit",
+                        args: [UInt64(portVal), UInt64(bitPattern: Int64(newLimit)), 0]
+                        ) & 0xFFFFFFFF))
+
+                    if setRet == 0 {
+                        return MultiplierResult(
+                            ok: true,
+                            approach: "footprint:tfp:\(procName)",
+                            prevActive: baseLimit, prevInactive: baseLimit,
+                            newActive:  newLimit,  newInactive: newLimit,
+                            detail: "task_set_phys_footprint_limit \(baseLimit)→\(newLimit) MB via \(procName)"
+                        )
+                    }
+                }
+            }
+
+            // ── Strategy B: MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT (cmd 6) ──
+            // cmd 6 takes limit in MB as the flags parameter — no buffer needed.
+            // It internally calls task_set_phys_footprint_limit_internal, so it
+            // raises the ledger cap AND the jetsam limit in one call.
+            //
+            // Read current limit first so we can multiply it.
+            var curBuf = [UInt8](repeating: 0, count: kMemlimitPropsSize)
+            curBuf.withUnsafeBytes { bytes in
+                rc.remote_write(trojan, from: bytes.baseAddress, size: UInt64(kMemlimitPropsSize))
+            }
+
+            let getRetB = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                args: [440,
+                       UInt64(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES),
+                       UInt64(bitPattern: Int64(pid)),
+                       0, trojan, UInt64(kMemlimitPropsSize)]) & 0xFFFFFFFF))
+
+            var baseActive: Int32 = 1500
+            if getRetB == 0 {
+                var readBuf = [UInt8](repeating: 0, count: kMemlimitPropsSize)
+                if readBuf.withUnsafeMutableBytes({ rc.remoteRead(trojan, to: $0.baseAddress, size: UInt64(kMemlimitPropsSize)) }) {
+                    let (a, _, _, _) = parseMemlimitProps(readBuf)
+                    if a > 0 { baseActive = a }
+                }
+            }
+
+            var newLimitB = baseActive * multiplier
+            if newLimitB > kFootprintCapMB { newLimitB = kFootprintCapMB }
+
+            let setRetB = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                args: [440,
+                       UInt64(MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT),
+                       UInt64(bitPattern: Int64(pid)),
+                       UInt64(newLimitB),
+                       0, 0]) & 0xFFFFFFFF))
+
+            if setRetB == 0 {
+                return MultiplierResult(
+                    ok: true,
+                    approach: "footprint:cmd6:\(procName)",
+                    prevActive: baseActive, prevInactive: baseActive,
+                    newActive:  newLimitB,  newInactive: newLimitB,
+                    detail: "MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT \(baseActive)→\(newLimitB) MB via \(procName)"
+                )
+            }
+        }
+
+        return .failure("footprint limit: all RC candidates failed for pid \(pid)")
     }
 
     // ── Approach 1: Direct memorystatus_control ───────────────────────────
@@ -1260,7 +1413,7 @@ struct JetsamView: View {
                 var propBuf = [UInt8](repeating: 0, count: 16)
                 withUnsafeBytes(of: band) { src in propBuf.replaceSubrange(0..<4, with: src) }
                 propBuf.withUnsafeBytes { bytes in
-                    rc.remote_write(trojan, from: bytes.baseAddress, size: 16)
+                    rc.remote_write(trojan, from: bytes.baseAddress, size: UInt64(16))
                 }
 
                 let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
