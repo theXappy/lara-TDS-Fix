@@ -52,10 +52,13 @@ private func memorystatus_control(
 //       as priority-set on your kernel), the fallback approaches will handle
 //       it — TASK_LIMIT (cmd 6), syscall(440), and KRW all work independently.
 private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:           Int32 = 1
-private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:     Int32 = 7  // original working value
+private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:     Int32 = 7  // sets jetsam band (priority)
 private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK:  Int32 = 5
 private let MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT:       Int32 = 6
-private let MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES:     Int32 = 7  // may overlap with above
+// ⚠️  CRITICAL: cmd 7 = SET_PRIORITY_PROPERTIES; cmd 9 = SET_MEMLIMIT_PROPERTIES.
+//     These are NOT the same. Using 7 for memlimit silently calls the wrong
+//     kernel path (priority update) with a mis-typed buffer → no effect.
+private let MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES:     Int32 = 9  // was wrongly 7
 private let MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES:     Int32 = 8
 
 // Bit flag for HWM hard-kill
@@ -96,17 +99,26 @@ private let MEMORYSTATUS_MEMLIMIT_ATTR_FATAL: UInt32 = 0x1
 //
 //     And initialise them in offsets.m alongside the other offset lookups.
 
-// Placeholder offsets — replace with real values from offsets_init()
-// once you've identified them for your target kernel.
-private var off_task_jetsam_priority:       UInt64 = 0x0   // NOT SET
-private var off_task_memlimit_active:       UInt64 = 0x0   // NOT SET
-private var off_task_memlimit_inactive:     UInt64 = 0x0   // NOT SET
-private var off_task_memlimit_active_attr:  UInt64 = 0x0   // NOT SET
-private var off_task_memlimit_inactive_attr:UInt64 = 0x0   // NOT SET
+// ── Task jetsam offsets — read from C globals set in offsets_init() ──────
+//
+// The C globals are declared in offsets.h (extern uint32_t off_task_*) and
+// must be initialised in offsets_init().  They are in the same Swift module
+// via the bridging header so we access them directly.
+//
+// Swift naming: prefix with "joff_" to avoid shadowing the C identifier
+// (a computed property named exactly the same as the C global would recurse).
+//
+// If offsets_init() leaves these 0, krwJetsamOffsetsReady is false and the
+// KRW path is skipped — the syscall(440) / RC paths still apply the limit.
+private var joff_task_jetsam_priority:        UInt64 { UInt64(off_task_jetsam_priority) }
+private var joff_task_memlimit_active:        UInt64 { UInt64(off_task_memlimit_active) }
+private var joff_task_memlimit_inactive:      UInt64 { UInt64(off_task_memlimit_inactive) }
+private var joff_task_memlimit_active_attr:   UInt64 { UInt64(off_task_memlimit_active_attr) }
+private var joff_task_memlimit_inactive_attr: UInt64 { UInt64(off_task_memlimit_inactive_attr) }
 
 /// Returns true if the KRW jetsam offsets have been configured (non-zero).
 private var krwJetsamOffsetsReady: Bool {
-    off_task_memlimit_active != 0 && off_task_memlimit_inactive != 0
+    joff_task_memlimit_active != 0 && joff_task_memlimit_inactive != 0
 }
 
 
@@ -434,22 +446,22 @@ struct JetsamMultiplier {
         }
 
         // Read current values
-        let activeOrig   = Int32(bitPattern: mgr.kread32(address: taskAddr + off_task_memlimit_active))
-        let inactiveOrig = Int32(bitPattern: mgr.kread32(address: taskAddr + off_task_memlimit_inactive))
+        let activeOrig   = Int32(bitPattern: mgr.kread32(address: taskAddr + joff_task_memlimit_active))
+        let inactiveOrig = Int32(bitPattern: mgr.kread32(address: taskAddr + joff_task_memlimit_inactive))
 
         // Multiply
         let newActive   = activeOrig > 0 ? activeOrig * multiplier : activeOrig
         let newInactive = inactiveOrig > 0 ? inactiveOrig * multiplier : inactiveOrig
 
         // Write back
-        mgr.kwrite32(address: taskAddr + off_task_memlimit_active,   value: UInt32(bitPattern: newActive))
-        mgr.kwrite32(address: taskAddr + off_task_memlimit_inactive, value: UInt32(bitPattern: newInactive))
+        mgr.kwrite32(address: taskAddr + joff_task_memlimit_active,   value: UInt32(bitPattern: newActive))
+        mgr.kwrite32(address: taskAddr + joff_task_memlimit_inactive, value: UInt32(bitPattern: newInactive))
 
         return MultiplierResult(
             ok: true, approach: "krw",
             prevActive: activeOrig, prevInactive: inactiveOrig,
             newActive: newActive, newInactive: newInactive,
-            detail: "direct kernel write to task+0x\(String(format: "%x", off_task_memlimit_active))"
+            detail: "direct kernel write to task+0x\(String(format: "%x", joff_task_memlimit_active))"
         )
     }
 
@@ -1225,41 +1237,92 @@ struct JetsamView: View {
         let band    = Int32(proc.targetBand)
         let limitMB = Int32(proc.limitMB)
 
-        // Set priority band
-        let bandOK = setJetsamBand(pid: Int32(proc.pid), band: band)
+        // ── Priority band ──────────────────────────────────────────────────
+        // Try direct first (works post-sbx if entitlement is present),
+        // then route through configd (uid 0, has com.apple.private.memorystatus).
+        var bandOK     = setJetsamBand(pid: Int32(proc.pid), band: band)
+        var bandSource = "direct"
 
-        // Set memory limit
-        var limitOK = true
+        if !bandOK {
+            // RC path: call memorystatus_control via syscall(440) inside configd
+            let rcio = RemoteFileIO.shared
+            let rcCandidates = ["configd", "SpringBoard", "securityd"]
+            for rcProc in rcCandidates {
+                guard let rc = rcio.rcProc(for: rcProc) else { continue }
+                let trojan = rc.trojanMem
+                guard trojan != 0 else { continue }
+
+                var propBuf = [UInt8](repeating: 0, count: 16)
+                withUnsafeBytes(of: band) { propBuf.replaceSubrange(0..<4, with: $0) }
+                propBuf.withUnsafeBytes { rcio.callIn(rc: rc, name: "memorystatus_control",
+                    args: [UInt64(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES),
+                           UInt64(bitPattern: Int64(proc.pid)), 0, trojan, 16]) }
+                // verify success: call again via syscall if dlsym may have missed the symbol
+                let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                    args: [440,
+                           UInt64(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES),
+                           UInt64(bitPattern: Int64(proc.pid)),
+                           0, trojan, 16]) & 0xFFFFFFFF))
+                if sysRet == 0 {
+                    bandOK = true
+                    bandSource = "rc:\(rcProc)"
+                    break
+                }
+            }
+        }
+
+        // ── Memory limit ───────────────────────────────────────────────────
+        var limitOK     = true
+        var limitSource = ""
+
         if limitMB > 0 {
-            let flags: UInt32 = UInt32(limitMB) | (proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0)
-            let ret = memorystatus_control(
+            // cmd 5 SET_JETSAM_HIGH_WATER_MARK: flags = MB value | optional fatal bit.
+            // Encoding: UInt32(MB) | MEMORYSTATUS_FLAGS_HWM_HARD
+            let hwmFlags: UInt32 = UInt32(bitPattern: limitMB) | (proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0)
+            let directRet = memorystatus_control(
                 MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
-                Int32(proc.pid),
-                flags,
-                nil,
-                0
-            )
-            limitOK = ret == 0
+                Int32(proc.pid), hwmFlags, nil, 0)
+            limitOK = directRet == 0
+            limitSource = "direct"
+
+            if !limitOK {
+                // RC path via syscall(440) on configd
+                let rcio = RemoteFileIO.shared
+                let rcCandidates = ["configd", "SpringBoard", "securityd"]
+                for rcProc in rcCandidates {
+                    guard let rc = rcio.rcProc(for: rcProc) else { continue }
+                    let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                        args: [440,
+                               UInt64(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK),
+                               UInt64(bitPattern: Int64(proc.pid)),
+                               UInt64(hwmFlags), 0, 0]) & 0xFFFFFFFF))
+                    if sysRet == 0 {
+                        limitOK = true
+                        limitSource = "rc:\(rcProc)"
+                        break
+                    }
+                }
+            }
         }
 
-        processes[idx].isProtected = bandOK
-        processes[idx].origBand    = bandOK ? proc.origBand : proc.origBand
+        processes[idx].isProtected = bandOK || limitOK
+        processes[idx].origBand    = proc.origBand
 
-        let limitDesc: String
+        // ── Status message ─────────────────────────────────────────────────
+        var parts: [String] = []
+        if bandOK  { parts.append("band→\(band) [\(bandSource)]") }
+        else       { parts.append("band FAILED (errno \(errno))") }
+
         if limitMB == -1 {
-            limitDesc = ", memory: system default"
+            parts.append("limit: system default")
         } else if limitMB > 0 {
-            limitDesc = ", \(limitMB) MB (\(proc.terminateOnLimit ? "hard kill" : "soft warn")) \(limitOK ? "✓" : "⚠ failed")"
-        } else {
-            limitDesc = ""
+            let limitDesc = "\(limitMB) MB (\(proc.terminateOnLimit ? "hard-kill" : "soft-warn"))"
+            if limitOK { parts.append("limit→\(limitDesc) [\(limitSource)]") }
+            else       { parts.append("limit FAILED (\(limitDesc), errno \(errno))") }
         }
 
-        if bandOK {
-            statusMessage = "Protected \(proc.name) → band \(band)\(limitDesc)"
-        } else {
-            statusMessage = "memorystatus_control failed for \(proc.name) (pid \(proc.pid)) — sbx escape may be required"
-        }
-        showStatus = true
+        statusMessage = "\(proc.name) pid \(proc.pid): " + parts.joined(separator: ", ")
+        showStatus    = true
     }
 
     private func restore(pid: Int32) {
