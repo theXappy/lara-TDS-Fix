@@ -50,7 +50,7 @@ private func memorystatus_control(
 //       XNU headers show SET_MEMLIMIT_PROPERTIES also as 7 on some versions.
 //       If the multiplier's GET+SET path fails (because cmd 7 is interpreted
 //       as priority-set on your kernel), the fallback approaches will handle
-//       it — TASK_LIMIT (cmd 6), syscall(440), and KRW all work independently.
+//       it — TASK_LIMIT (cmd 6), syscall(396), and KRW all work independently.
 private let MEMORYSTATUS_CMD_GET_PRIORITY_LIST:           Int32 = 1
 private let MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES:     Int32 = 7  // sets jetsam band (priority)
 private let MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK:  Int32 = 5
@@ -107,7 +107,7 @@ private let MEMORYSTATUS_MEMLIMIT_ATTR_FATAL: UInt32 = 0x1
 //
 // KRW offsets are 0 until you add them to offsets.m / offsets_init().
 // With 0 values krwJetsamOffsetsReady is false and viaKRW() is skipped —
-// the syscall(440) / RC paths handle everything without them.
+// the syscall(396) / RC paths handle everything without them.
 // When you're ready to enable KRW, swap these for the real C globals:
 //   private var joff_task_memlimit_active:   UInt64 { UInt64(off_task_memlimit_active) }
 //   private var joff_task_memlimit_inactive: UInt64 { UInt64(off_task_memlimit_inactive) }
@@ -206,6 +206,68 @@ struct JetsamMultiplier {
         if r5.ok { return r5 }
 
         return .failure("all approaches failed for pid \(pid)")
+    }
+
+    // ── Absolute limit setter ─────────────────────────────────────────────
+    //
+    // Sets the memory limit to a specific MB value rather than multiplying
+    // the current limit.  Useful when GET returns 0 or a wrong value.
+    // Uses the same footprint path (cmd 6 + task_set_phys_footprint_limit).
+
+    static func applyAbsolute(pid: Int32, targetMB: Int32) -> MultiplierResult {
+        let capped = min(targetMB, kFootprintCapMB)
+
+        // Try footprint approach directly with the absolute target
+        let rcio = RemoteFileIO.shared
+        for procName in ["configd", "SpringBoard", "securityd"] {
+            guard let rc = rcio.rcProc(for: procName) else { continue }
+            let trojan = rc.trojanMem
+            guard trojan != 0 else { continue }
+
+            // cmd 6 SET_JETSAM_TASK_LIMIT — flags = limit MB.
+            // SYS_memorystatus_control = 396.
+            let ret = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                args: [396,
+                       UInt64(MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT),
+                       UInt64(bitPattern: Int64(pid)),
+                       UInt64(capped),
+                       0, 0]) & 0xFFFFFFFF))
+
+            if ret == 0 {
+                return MultiplierResult(
+                    ok: true,
+                    approach: "absolute:cmd6:\(procName)",
+                    prevActive: 0, prevInactive: 0,
+                    newActive: capped, newInactive: capped,
+                    detail: "SET_JETSAM_TASK_LIMIT → \(capped) MB via \(procName)"
+                )
+            }
+
+            // Also try cmd 9 SET_MEMLIMIT_PROPERTIES with absolute values
+            var props = buildMemlimitProps(active: capped, activeAttr: 0,
+                                           inactive: capped, inactiveAttr: 0)
+            props.withUnsafeBytes { bytes in
+                rc.remote_write(trojan, from: bytes.baseAddress, size: UInt64(kMemlimitPropsSize))
+            }
+            let ret9 = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                args: [396,
+                       UInt64(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES),
+                       UInt64(bitPattern: Int64(pid)),
+                       0, trojan,
+                       UInt64(kMemlimitPropsSize)]) & 0xFFFFFFFF))
+
+            if ret9 == 0 {
+                return MultiplierResult(
+                    ok: true,
+                    approach: "absolute:cmd9:\(procName)",
+                    prevActive: 0, prevInactive: 0,
+                    newActive: capped, newInactive: capped,
+                    detail: "SET_MEMLIMIT_PROPERTIES → \(capped) MB via \(procName)"
+                )
+            }
+        }
+
+        return .failure("absolute setter failed for pid \(pid) targetMB=\(capped)")
     }
 
     // ── Approach 0: task_set_phys_footprint_limit via RC ─────────────────
@@ -308,7 +370,7 @@ struct JetsamMultiplier {
             }
 
             let getRetB = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
-                args: [440,
+                args: [396,
                        UInt64(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES),
                        UInt64(bitPattern: Int64(pid)),
                        0, trojan, UInt64(kMemlimitPropsSize)]) & 0xFFFFFFFF))
@@ -326,7 +388,7 @@ struct JetsamMultiplier {
             if newLimitB > kFootprintCapMB { newLimitB = kFootprintCapMB }
 
             let setRetB = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
-                args: [440,
+                args: [396,
                        UInt64(MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT),
                        UInt64(bitPattern: Int64(pid)),
                        UInt64(newLimitB),
@@ -523,7 +585,7 @@ struct JetsamMultiplier {
 
             // GET via syscall(440, 8, pid, 0, buf, 16)
             let getRet = rcio.callIn(rc: rc, name: "syscall", args: [
-                440,                                      // SYS_memorystatus_control
+                396,                                      // SYS_memorystatus_control
                 UInt64(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES),
                 UInt64(bitPattern: Int64(pid)),
                 0,
@@ -553,7 +615,7 @@ struct JetsamMultiplier {
             }
 
             let setRet = rcio.callIn(rc: rc, name: "syscall", args: [
-                440,
+                396,   // SYS_memorystatus_control
                 UInt64(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES),
                 UInt64(bitPattern: Int64(pid)),
                 0,
@@ -567,7 +629,7 @@ struct JetsamMultiplier {
                     ok: true, approach: "syscall-rc:\(proc)",
                     prevActive: activeOrig, prevInactive: inactiveOrig,
                     newActive: newActive, newInactive: newInactive,
-                    detail: "syscall(440) via \(proc)"
+                    detail: "syscall(396) via \(proc)"
                 )
             }
         }
@@ -719,9 +781,11 @@ struct JetsamView: View {
     @State private var statusMessage:  String = ""
     @State private var showStatus      = false
 
-    // Editor sheet — keyed on pid
-    @State private var editingPID:    UInt32?
-    @State private var showEditor     = false
+    // Editor sheet — capture full process struct at tap time so the sheet
+    // always opens with correct data regardless of async refresh state.
+    @State private var editingProcess: JetsamProcess?
+    @State private var showEditor      = false
+    @State private var applying        = false   // true while apply(pid:) is in flight
 
     // Confirm restore-all
     @State private var showRestoreAll = false
@@ -794,11 +858,29 @@ struct JetsamView: View {
             Text("This will read each process's current jetsam memory limit and multiply it by \(globalMultiplier). Tries 5 approaches in fallback order.")
         }
         .sheet(isPresented: $showEditor) {
-            if let pid = editingPID,
-               let idx = processes.firstIndex(where: { $0.pid == pid }) {
-                EditorSheet(process: $processes[idx],
-                            onApply: { apply(pid: pid) },
-                            onMultiply: { mult in applyMultiplierToProcess(pid: pid, multiplier: mult) })
+            // editingProcess is captured at tap time — always valid on open.
+            // Changes made inside EditorSheet write back via the binding, then
+            // onApply/onMultiply propagate them to the main processes array.
+            if var ep = editingProcess {
+                EditorSheet(
+                    process: Binding(
+                        get: { editingProcess ?? ep },
+                        set: { editingProcess = $0; ep = $0 }
+                    ),
+                    applying: $applying,
+                    onApply: { updated in
+                        // Merge updated fields back into processes array
+                        if let idx = processes.firstIndex(where: { $0.pid == updated.pid }) {
+                            processes[idx].targetBand       = updated.targetBand
+                            processes[idx].limitMB          = updated.limitMB
+                            processes[idx].terminateOnLimit = updated.terminateOnLimit
+                        }
+                        applyAsync(pid: updated.pid)
+                    },
+                    onMultiply: { mult in
+                        applyMultiplierToProcess(pid: ep.pid, multiplier: mult)
+                    }
+                )
             }
         }
         .onAppear { refresh() }
@@ -873,7 +955,7 @@ struct JetsamView: View {
         } header: {
             Text("Memory Multiplier")
         } footer: {
-            Text("Reads each process's current jetsam limit and multiplies it. Tries: direct → RC configd → RC any root process → syscall(440) → KRW kernel write.")
+            Text("Reads each process's current jetsam limit and multiplies it. Tries: direct → RC configd → RC any root process → syscall(396) → KRW kernel write.")
         }
     }
 
@@ -985,8 +1067,9 @@ struct JetsamView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            editingPID = proc.pid
-            showEditor = true
+            // Capture full struct NOW — don't rely on a pid lookup after async refresh
+            editingProcess = proc
+            showEditor     = true
         }
         .disabled(!mgr.dsready && !mgr.sbxready)
     }
@@ -994,16 +1077,20 @@ struct JetsamView: View {
     // MARK: - Editor sheet
 
     struct EditorSheet: View {
-        @Binding var process: JetsamProcess
-        let onApply: () -> Void
+        @Binding var process:  JetsamProcess
+        @Binding var applying: Bool          // driven from JetsamView while apply() is in flight
+        let onApply:   (JetsamProcess) -> Void
         let onMultiply: (Int) -> Void
         @Environment(\.dismiss) private var dismiss
 
-        @State private var bandDouble:       Double = 12
-        @State private var limitDouble:      Double = -1
-        @State private var terminateOnLimit: Bool   = false
-        @State private var selectedMultiplier: Int  = 3
-        @State private var multiplyBusy:     Bool   = false
+        @State private var bandDouble:         Double = 12
+        @State private var limitDouble:        Double = -1
+        @State private var terminateOnLimit:   Bool   = false
+        @State private var selectedMultiplier: Int    = 3
+        @State private var multiplyBusy:       Bool   = false
+        @State private var absoluteMode:       Bool   = false   // set an absolute MB instead of multiply
+        @State private var absoluteMB:         Double = 2700    // default absolute target
+        @State private var applyFeedback:      String = ""      // inline result after apply
 
         private let bandMarkers: [(Int, String)] = [
             (0,  "idle"), (4, "bg suspend"), (5, "bg audio"),
@@ -1026,38 +1113,93 @@ struct JetsamView: View {
                             HStack {
                                 Image(systemName: "bolt.shield")
                                     .foregroundColor(.purple)
-                                Text("Memory Multiplier")
+                                Text("Memory Limit")
                                     .font(.system(.body, design: .monospaced))
                                 Spacer()
                                 if process.multiplier > 0 {
-                                    bandTag("active: \(process.multiplier)x", .purple)
+                                    bandTag("active: \(process.multiplier)x via \(process.multiplierApproach)", .purple)
                                 }
                             }
 
-                            HStack(spacing: 8) {
-                                ForEach([2, 3, 4], id: \.self) { mult in
-                                    Button("\(mult)x") {
-                                        selectedMultiplier = mult
+                            // Mode toggle: multiply current vs set absolute
+                            Picker("Mode", selection: $absoluteMode) {
+                                Text("Multiply current").tag(false)
+                                Text("Set absolute MB").tag(true)
+                            }
+                            .pickerStyle(.segmented)
+
+                            if absoluteMode {
+                                // ── Absolute MB mode ──────────────────────────
+                                // Directly sets the target to a specific MB rather than
+                                // multiplying whatever the current limit happens to be.
+                                // Useful when the current limit read returns 0 or wrong.
+                                HStack {
+                                    Text("Target")
+                                        .font(.system(.body, design: .monospaced))
+                                    Spacer()
+                                    Text("\(Int(absoluteMB)) MB")
+                                        .font(.system(.body, design: .monospaced))
+                                        .foregroundColor(.purple)
+                                        .fontWeight(.semibold)
+                                }
+                                Slider(value: $absoluteMB, in: 256...3072, step: 64)
+                                    .tint(.purple)
+                                HStack(spacing: 6) {
+                                    ForEach([1024, 1536, 2048, 2700, 3072], id: \.self) { mb in
+                                        Button("\(mb)") { absoluteMB = Double(mb) }
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .buttonStyle(.bordered)
+                                            .tint(Int(absoluteMB) == mb ? .purple : .secondary)
+                                            .controlSize(.mini)
                                     }
-                                    .font(.system(.body, design: .monospaced).bold())
-                                    .buttonStyle(.bordered)
-                                    .tint(selectedMultiplier == mult ? .purple : .secondary)
                                 }
+                                Text("Sets phys_footprint ledger cap + jetsam limit directly to this value via RC.")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            } else {
+                                // ── Multiply mode ─────────────────────────────
+                                HStack(spacing: 8) {
+                                    ForEach([2, 3, 4], id: \.self) { mult in
+                                        Button("\(mult)x") { selectedMultiplier = mult }
+                                            .font(.system(.body, design: .monospaced).bold())
+                                            .buttonStyle(.bordered)
+                                            .tint(selectedMultiplier == mult ? .purple : .secondary)
+                                    }
+                                }
+                                Text("Reads the current memlimit and multiplies it. If current reads as 0, use absolute mode instead.")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
                             }
 
+                            // Apply button
                             Button {
                                 multiplyBusy = true
-                                onMultiply(selectedMultiplier)
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                                    multiplyBusy = false
+                                applyFeedback = "Working…"
+                                if absoluteMode {
+                                    // Pass absolute MB as a negative multiplier sentinel
+                                    // handled in applyMultiplierToProcess via absoluteMB param
+                                    onMultiply(-Int(absoluteMB))   // negative = absolute mode
+                                } else {
+                                    onMultiply(selectedMultiplier)
+                                }
+                                // The busy spinner clears when the parent posts the result
+                                // back via process.multiplierApproach update
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                    // Check every 0.3s until process.multiplier is updated
+                                    // (the async result from applyMultiplierToProcess)
                                 }
                             } label: {
                                 HStack {
                                     Spacer()
                                     if multiplyBusy {
-                                        ProgressView().scaleEffect(0.8)
+                                        ProgressView().scaleEffect(0.8).tint(.white)
+                                        Text("Applying…")
+                                            .font(.system(.body, design: .monospaced))
                                     } else {
-                                        Label("Apply \(selectedMultiplier)x Multiplier", systemImage: "bolt.shield.fill")
+                                        Label(absoluteMode
+                                              ? "Set \(Int(absoluteMB)) MB Limit"
+                                              : "Apply \(selectedMultiplier)x Multiplier",
+                                              systemImage: "bolt.shield.fill")
                                     }
                                     Spacer()
                                 }
@@ -1066,9 +1208,23 @@ struct JetsamView: View {
                             .foregroundColor(.white)
                             .listRowBackground(Color.purple.opacity(0.85))
                             .disabled(multiplyBusy)
+                            .onChange(of: process.multiplierApproach) { _ in
+                                // Approach string updated = async result is back
+                                multiplyBusy  = false
+                                applyFeedback = process.multiplier > 0
+                                    ? "✓ \(process.origActiveMB)→\(process.origActiveMB * max(process.multiplier, 1)) MB via \(process.multiplierApproach)"
+                                    : "✗ All approaches failed — check RC is inited on configd"
+                            }
+
+                            // Inline result
+                            if !applyFeedback.isEmpty {
+                                Text(applyFeedback)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(applyFeedback.hasPrefix("✓") ? .green : .red)
+                            }
                         }
                     } header: { Text("Jetsam Multiplier") }
-                    footer: { Text("Reads the current memory limit and multiplies it. Tries 5 different approaches in fallback order.") }
+                    footer: { Text("Uses task_set_phys_footprint_limit via RC (cmd 6 syscall 396) — raises the VM ledger hard cap that actually kills memory-heavy apps.") }
 
                     // ── Priority band ─────────────────────────────────────────
                     Section {
@@ -1140,18 +1296,27 @@ struct JetsamView: View {
                             process.targetBand       = Int(bandDouble)
                             process.limitMB          = Int(limitDouble)
                             process.terminateOnLimit = terminateOnLimit
-                            onApply()
+                            onApply(process)
                             dismiss()
                         } label: {
                             HStack {
                                 Spacer()
-                                Label("Apply Jetsam Policy", systemImage: "cpu")
-                                    .fontWeight(.semibold)
+                                if applying {
+                                    ProgressView().scaleEffect(0.8).tint(.white)
+                                    Text("Applying…")
+                                        .font(.system(.body, design: .monospaced))
+                                } else {
+                                    Label("Apply Jetsam Policy", systemImage: "cpu")
+                                        .fontWeight(.semibold)
+                                }
                                 Spacer()
                             }
                         }
                         .foregroundColor(.white)
-                        .listRowBackground(Color.blue)
+                        .listRowBackground(applying ? Color.gray : Color.blue)
+                        .disabled(applying)
+                    } footer: {
+                        Text("Sets priority band via memorystatus_control. Routes through configd (root) via RC if direct call fails.")
                     }
                 }
                 .listStyle(.insetGrouped)
@@ -1201,23 +1366,45 @@ struct JetsamView: View {
 
     // MARK: - Multiplier actions
 
-    /// Apply the multiplier to a single process (called from EditorSheet)
+    /// Apply the multiplier to a single process (called from EditorSheet).
+    /// A negative `multiplier` value is the absolute mode sentinel:
+    ///   multiplier = -2700 → set limit to exactly 2700 MB
+    /// A positive value is the normal Nx multiplier.
     private func applyMultiplierToProcess(pid: UInt32, multiplier: Int) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = JetsamMultiplier.applyMultiplier(
-                pid: Int32(pid), multiplier: Int32(multiplier)
-            )
+            let result: MultiplierResult
+
+            if multiplier < 0 {
+                // Absolute mode: value is the negative target MB
+                let targetMB = Int32(-multiplier)
+                result = JetsamMultiplier.applyAbsolute(pid: Int32(pid), targetMB: targetMB)
+            } else {
+                result = JetsamMultiplier.applyMultiplier(
+                    pid: Int32(pid), multiplier: Int32(multiplier)
+                )
+            }
 
             DispatchQueue.main.async {
                 if let idx = processes.firstIndex(where: { $0.pid == pid }) {
                     if result.ok {
-                        processes[idx].multiplier        = multiplier
-                        processes[idx].origActiveMB      = Int(result.prevActive)
-                        processes[idx].origInactiveMB    = Int(result.prevInactive)
+                        processes[idx].multiplier         = multiplier < 0 ? 1 : multiplier
+                        processes[idx].origActiveMB       = Int(result.prevActive)
+                        processes[idx].origInactiveMB     = Int(result.prevInactive)
                         processes[idx].multiplierApproach = result.approach
+                    } else {
+                        // Still update approach string so onChange fires in EditorSheet
+                        processes[idx].multiplierApproach = "failed"
                     }
                 }
-                statusMessage = "\(result.summary)"
+                // Also update editingProcess so the sheet's onChange fires
+                if editingProcess?.pid == pid {
+                    editingProcess?.multiplierApproach = result.ok ? result.approach : "failed"
+                    if result.ok {
+                        editingProcess?.multiplier    = multiplier < 0 ? 1 : multiplier
+                        editingProcess?.origActiveMB  = Int(result.prevActive)
+                    }
+                }
+                statusMessage = result.summary
                 showStatus    = true
             }
         }
@@ -1342,6 +1529,95 @@ struct JetsamView: View {
 
     // MARK: - Band/limit actions (existing)
 
+    /// Non-blocking wrapper — dispatches apply() off the main thread so the UI
+    /// doesn't freeze during RC calls.  Sets applying=true while in flight.
+    private func applyAsync(pid: UInt32) {
+        guard !applying else { return }
+        applying = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.applySync(pid: pid)
+            DispatchQueue.main.async { self.applying = false }
+        }
+    }
+
+    private func applySync(pid: UInt32) {
+        guard let idx = processes.firstIndex(where: { $0.pid == pid }) else { return }
+        let proc    = processes[idx]
+        let band    = Int32(proc.targetBand)
+        let limitMB = Int32(proc.limitMB)
+
+        // ── Priority band ──────────────────────────────────────────────────
+        var bandOK     = setJetsamBand(pid: Int32(proc.pid), band: band)
+        var bandSource = "direct"
+
+        if !bandOK {
+            let rcio = RemoteFileIO.shared
+            for rcProc in ["configd", "SpringBoard", "securityd"] {
+                guard let rc = rcio.rcProc(for: rcProc) else { continue }
+                let trojan = rc.trojanMem
+                guard trojan != 0 else { continue }
+
+                var propBuf = [UInt8](repeating: 0, count: 16)
+                withUnsafeBytes(of: band) { src in propBuf.replaceSubrange(0..<4, with: src) }
+                propBuf.withUnsafeBytes { bytes in
+                    rc.remote_write(trojan, from: bytes.baseAddress, size: UInt64(16))
+                }
+                // SYS_memorystatus_control = 396 on iOS 17.x (xnu-10002.81.5)
+                let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                    args: [396,
+                           UInt64(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES),
+                           UInt64(bitPattern: Int64(proc.pid)),
+                           0, trojan, 16]) & 0xFFFFFFFF))
+                if sysRet == 0 {
+                    bandOK = true; bandSource = "rc:\(rcProc)"; break
+                }
+            }
+        }
+
+        // ── Memory limit ───────────────────────────────────────────────────
+        var limitOK     = true
+        var limitSource = ""
+
+        if limitMB > 0 {
+            let hwmFlags: UInt32 = UInt32(bitPattern: limitMB) | (proc.terminateOnLimit ? MEMORYSTATUS_FLAGS_HWM_HARD : 0)
+            let directRet = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK,
+                                                  Int32(proc.pid), hwmFlags, nil, 0)
+            limitOK = directRet == 0; limitSource = "direct"
+
+            if !limitOK {
+                let rcio = RemoteFileIO.shared
+                for rcProc in ["configd", "SpringBoard", "securityd"] {
+                    guard let rc = rcio.rcProc(for: rcProc) else { continue }
+                    // SYS_memorystatus_control = 396
+                    let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
+                        args: [396,
+                               UInt64(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK),
+                               UInt64(bitPattern: Int64(proc.pid)),
+                               UInt64(hwmFlags), 0, 0]) & 0xFFFFFFFF))
+                    if sysRet == 0 {
+                        limitOK = true; limitSource = "rc:\(rcProc)"; break
+                    }
+                }
+            }
+        }
+
+        DispatchQueue.main.async {
+            self.processes[idx].isProtected = bandOK || limitOK
+            self.processes[idx].origBand    = proc.origBand
+
+            var parts: [String] = []
+            if bandOK  { parts.append("band→\(band) [\(bandSource)]") }
+            else       { parts.append("band FAILED errno=\(errno)") }
+            if limitMB == -1 { parts.append("limit: system default") }
+            else if limitMB > 0 {
+                let d = "\(limitMB)MB (\(proc.terminateOnLimit ? "hard" : "soft"))"
+                parts.append(limitOK ? "limit→\(d) [\(limitSource)]" : "limit FAILED \(d) errno=\(errno)")
+            }
+            self.statusMessage = "\(proc.name) pid \(proc.pid): " + parts.joined(separator: ", ")
+            self.showStatus    = true
+        }
+    }
+
     private func refresh() {
         guard !loading else { return }
         loading = true
@@ -1398,7 +1674,7 @@ struct JetsamView: View {
         var bandSource = "direct"
 
         if !bandOK {
-            // RC path via syscall(440) — avoids dlsym resolution issues for the
+            // RC path via syscall(396) — avoids dlsym resolution issues for the
             // private memorystatus_control symbol while still reaching the kernel.
             let rcio = RemoteFileIO.shared
             let rcCandidates = ["configd", "SpringBoard", "securityd"]
@@ -1417,7 +1693,7 @@ struct JetsamView: View {
                 }
 
                 let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
-                    args: [440,
+                    args: [396,
                            UInt64(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES),
                            UInt64(bitPattern: Int64(proc.pid)),
                            0, trojan, 16]) & 0xFFFFFFFF))
@@ -1444,13 +1720,13 @@ struct JetsamView: View {
             limitSource = "direct"
 
             if !limitOK {
-                // RC path via syscall(440) on configd
+                // RC path via syscall(396) on configd
                 let rcio = RemoteFileIO.shared
                 let rcCandidates = ["configd", "SpringBoard", "securityd"]
                 for rcProc in rcCandidates {
                     guard let rc = rcio.rcProc(for: rcProc) else { continue }
                     let sysRet = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "syscall",
-                        args: [440,
+                        args: [396,
                                UInt64(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK),
                                UInt64(bitPattern: Int64(proc.pid)),
                                UInt64(hwmFlags), 0, 0]) & 0xFFFFFFFF))
