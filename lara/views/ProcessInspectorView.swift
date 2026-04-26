@@ -261,6 +261,8 @@ struct ProcessDetailSheet: View {
     @State private var killStatus:   String?
     @State private var confirmKill:  TerminateMode? = nil
     @State private var isInitiating  = false   // true while RC init is in flight
+    @State private var liveTaskInfo: ProcTaskInfo? = nil   // fetched via RC if direct fails
+    @State private var loadingMemory = false
 
     enum TerminateMode: Identifiable {
         case sigterm, sigkill
@@ -297,12 +299,33 @@ struct ProcessDetailSheet: View {
                         infoRow("Threads",  "\(ti.pti_threadnum) (\(ti.pti_numrunning) running)")
                         infoRow("Faults",   "\(ti.pti_faults)")
                         infoRow("Priority", "\(ti.pti_priority)")
+                    } else if liveTaskInfo != nil {
+                        // Loaded via RC on a privileged process
+                        let ti = liveTaskInfo!
+                        infoRow("Resident", String(format: "%.1f MB", Double(ti.pti_resident_size) / (1024 * 1024)))
+                        infoRow("Virtual",  String(format: "%.1f MB", Double(ti.pti_virtual_size)  / (1024 * 1024)))
+                        infoRow("Threads",  "\(ti.pti_threadnum) (\(ti.pti_numrunning) running)")
+                        infoRow("Faults",   "\(ti.pti_faults)")
+                        infoRow("Priority", "\(ti.pti_priority)")
+                        Text("(fetched via RC)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    } else if loadingMemory {
+                        HStack(spacing: 8) {
+                            ProgressView().scaleEffect(0.8)
+                            Text("Fetching memory info…")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
                     } else {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Memory info unavailable")
                                 .font(.system(size: 13, design: .monospaced))
                                 .foregroundColor(.secondary)
-                            Text("proc_pidinfo returned no data. Run the exploit on the Home tab, or try initialising RC for this process.")
+                            // proc_pidinfo requires matching UID or root at the BSD
+                            // credential layer — MAC bypass alone is insufficient.
+                            // Init RC on this process or configd to enable RC-based fetch.
+                            Text("proc_pidinfo needs root or same-UID. Init RC on this process (or configd) to enable remote fetch.")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
@@ -438,24 +461,102 @@ struct ProcessDetailSheet: View {
             .onChange(of: isRCReady) { ready in
                 if ready || isRCIniting == false { isInitiating = false }
             }
+            .onAppear {
+                // If direct proc_pidinfo failed at scan time, attempt a live fetch
+                // via RC on a privileged process. proc_pidinfo requires matching UID
+                // or root — direct calls from lara (mobile) fail for root processes.
+                if process.taskInfo == nil {
+                    fetchMemoryViaRC()
+                }
+            }
+        }
+    }
+
+    // MARK: - RC memory fetch
+
+    private func fetchMemoryViaRC() {
+        guard !loadingMemory else { return }
+        loadingMemory = true
+        let pid = Int32(process.pid)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Try direct first (in case sbx escape elevated our privilege since scan)
+            if let ti = getTaskInfo(pid: pid) {
+                DispatchQueue.main.async { self.liveTaskInfo = ti; self.loadingMemory = false }
+                return
+            }
+
+            // Route through a root RC process: call proc_pidinfo(pid, 4, 0, buf, 96)
+            // configd (uid 0) can read task info for any process.
+            let rcio = RemoteFileIO.shared
+            let candidates = ["configd", "SpringBoard", "securityd"]
+
+            for procName in candidates {
+                guard let rc = rcio.rcProc(for: procName) else { continue }
+                let trojan = rc.trojanMem
+                guard trojan != 0 else { continue }
+
+                // Zero the remote buffer first
+                var zeroBuf = [UInt8](repeating: 0, count: 96)
+                zeroBuf.withUnsafeBytes { rc.remote_write(trojan, from: $0.baseAddress, size: 96) }
+
+                // proc_pidinfo(pid, PROC_PIDTASKINFO=4, 0, buf, 96)
+                let ret = Int32(bitPattern: UInt32(rcio.callIn(rc: rc, name: "proc_pidinfo",
+                    args: [UInt64(bitPattern: Int64(pid)), 4, 0, trojan, 96]) & 0xFFFFFFFF))
+
+                guard ret > 0 else { continue }
+
+                // Read back the struct
+                var raw = [UInt8](repeating: 0, count: 96)
+                let ok = raw.withUnsafeMutableBytes { rc.remoteRead(trojan, to: $0.baseAddress, size: 96) }
+                guard ok else { continue }
+
+                var ti = ProcTaskInfo()
+                withUnsafeMutableBytes(of: &ti) { dst in
+                    raw.withUnsafeBytes { src in
+                        dst.copyMemory(from: src)
+                    }
+                }
+                DispatchQueue.main.async { self.liveTaskInfo = ti; self.loadingMemory = false }
+                return
+            }
+
+            DispatchQueue.main.async { self.loadingMemory = false }
         }
     }
 
     // MARK: - Kill helper
 
     private func killProcess(pid: Int32, signal: Int32) {
-        // Attempt 1: Jetsam TERMINATE_PROCESS (bypasses signal delivery, more reliable post-sbx)
+        // Attempt 1: Jetsam TERMINATE_PROCESS (needs com.apple.private.memorystatus)
         if jetsamTerminate(pid: pid) {
-            killStatus = "Jetsam terminated pid \(pid)"
+            killStatus = "✓ Jetsam-terminated pid \(pid)"
             return
         }
-        // Attempt 2: Darwin kill() (works for mobile processes post-sbx-escape)
-        let ret = Darwin.kill(pid, signal)
-        if ret == 0 {
-            killStatus = "Sent \(signal == SIGKILL ? "SIGKILL" : "SIGTERM") to pid \(pid)"
-        } else {
-            killStatus = "kill() failed (errno=\(errno)) — may need root or RC"
+
+        // Attempt 2: Darwin kill() — works for mobile-uid targets post-sbx-escape
+        if Darwin.kill(pid, signal) == 0 {
+            killStatus = "✓ Sent \(signal == SIGKILL ? "SIGKILL" : "SIGTERM") to pid \(pid)"
+            return
         }
+        let directErrno = errno
+
+        // Attempt 3: RC kill via configd (uid 0) — works for root-uid targets
+        // kill() from a root process succeeds regardless of target UID.
+        let rcio = RemoteFileIO.shared
+        let rcCandidates = ["configd", "SpringBoard", "securityd"]
+        for procName in rcCandidates {
+            guard let rc = rcio.rcProc(for: procName) else { continue }
+            let ret = Int32(bitPattern: UInt32(rcio.callIn(
+                rc: rc, name: "kill",
+                args: [UInt64(bitPattern: Int64(pid)), UInt64(signal)]) & 0xFFFFFFFF))
+            if ret == 0 {
+                killStatus = "✓ Sent \(signal == SIGKILL ? "SIGKILL" : "SIGTERM") to pid \(pid) via rc:\(procName)"
+                return
+            }
+        }
+
+        killStatus = "✗ All approaches failed (direct errno=\(directErrno)). Init RC on configd first."
     }
 
     // MARK: - View helpers
