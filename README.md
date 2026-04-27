@@ -20,6 +20,9 @@
   <a href="https://github.com/rooootdev/lara/releases">
     <img src="https://img.shields.io/github/v/release/rooootdev/lara" alt="Release">
   </a>
+   <a href="https://github.com/rooootdev/lara/actions">
+    <img src="https://img.shields.io/github/actions/workflow/status/rooootdev/lara/build.yml?branch=main&style=flat&logo=github" alt="GitHub Actions">
+  </a>
 </p>
 
 <p align="center">
