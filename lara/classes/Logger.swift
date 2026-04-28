@@ -17,6 +17,11 @@ import SwiftUI
 
 let globallogger = Logger()
 
+@_cdecl("lara_log")
+func lara_log(_ msg: UnsafePointer<CChar>) {
+    globallogger.log(String(cString: msg))
+}
+
 class Logger: ObservableObject {
     @Published var logs: [String] = []
 
