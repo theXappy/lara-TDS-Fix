@@ -143,32 +143,54 @@ struct ContentView: View {
                                 }
                                 .disabled(!mgr.dsready || mgr.vfsready || mgr.vfsrunning)
 
-                            if mgr.vfsready {
-                                NavigationLink("Tweaks") {
-                                    List {
-                                        NavigationLink("Font Overwrite") {
-                                            FontPicker(mgr: mgr)
-                                        }
+                                if mgr.vfsready {
+                                    NavigationLink("Tweaks") {
+                                        List {
+                                            NavigationLink("Font Overwrite") {
+                                                FontPicker(mgr: mgr)
+                                            }
 
-                                        NavigationLink("Card Overwrite") {
-                                            CardView()
-                                        }
+                                            NavigationLink("Card Overwrite") {
+                                                CardView()
+                                            }
 
-                                        NavigationLink("Custom Overwrite") {
-                                            CustomView(mgr: mgr)
+                                            NavigationLink("Custom Overwrite") {
+                                                CustomView(mgr: mgr)
+                                            }
+
+                                            NavigationLink("DirtyZero (Broken)") {
+                                                ZeroView(mgr: mgr)
+                                            }
+
+                                            if !showfmintabs {
+                                                NavigationLink("File Manager") {
+                                                    SantanderView(startPath: "/")
+                                                }
+                                            }
                                         }
                                         .navigationTitle("Tweaks")
                                     }
                                 }
 
-                                        NavigationLink("DirtyZero (Broken)") {
-                                            ZeroView(mgr: mgr)
+                            } else if selectedmethod == .sbx {
+                                Button {
+                                    mgr.sbxescape()
+                                } label: {
+                                    if mgr.sbxrunning {
+                                        HStack {
+                                            ProgressView().progressViewStyle(.circular)
+                                                .frame(width: 18, height: 18)
+                                            Text("Escaping Sandbox...")
                                         }
-
-                                        if !showfmintabs {
-                                            NavigationLink("File Manager") {
-                                                SantanderView(startPath: "/")
+                                    } else if !mgr.sbxready {
+                                        if mgr.sbxattempted && mgr.sbxfailed {
+                                            HStack {
+                                                Text("SBX Failed")
+                                                Spacer()
+                                                Image(systemName: "xmark.circle").foregroundColor(.red)
                                             }
+                                        } else {
+                                            Text("Escape Sandbox")
                                         }
                                     } else {
                                         HStack {
@@ -180,38 +202,39 @@ struct ContentView: View {
                                 }
                                 .disabled(!mgr.dsready || mgr.sbxready || mgr.sbxrunning)
 
-                            if mgr.sbxready {
-                                NavigationLink("Tweaks") {
-                                    List {
-                                        if !showfmintabs {
-                                            NavigationLink("File Manager") {
-                                                SantanderView(startPath: "/")
-                                            }
-                                        }
-
-                                        NavigationLink("Card Overwrite") {
-                                            CardView()
-                                        }
-
-                                        NavigationLink("3 App Bypass") {
-                                            AppsView(mgr: mgr)
-                                        }
-
-                                        NavigationLink("VarClean") {
-                                            VarCleanView()
-                                        }
-
-                                        NavigationLink("Unblacklist (Broken?)") {
-                                            WhitelistView()
-                                        }
-
-                                        if 1 == 2 {
-                                            NavigationLink("MobileGestalt") {
-                                                EditorView()
+                                if mgr.sbxready {
+                                    NavigationLink("Tweaks") {
+                                        List {
+                                            if !showfmintabs {
+                                                NavigationLink("File Manager") {
+                                                    SantanderView(startPath: "/")
+                                                }
                                             }
 
-                                            NavigationLink("Passcode Theme") {
-                                                PasscodeView(mgr: mgr)
+                                            NavigationLink("Card Overwrite") {
+                                                CardView()
+                                            }
+
+                                            NavigationLink("3 App Bypass") {
+                                                AppsView(mgr: mgr)
+                                            }
+
+                                            NavigationLink("VarClean") {
+                                                VarCleanView()
+                                            }
+
+                                            NavigationLink("Unblacklist (Broken?)") {
+                                                WhitelistView()
+                                            }
+
+                                            if 1 == 2 {
+                                                NavigationLink("MobileGestalt") {
+                                                    EditorView()
+                                                }
+
+                                                NavigationLink("Passcode Theme") {
+                                                    PasscodeView(mgr: mgr)
+                                                }
                                             }
                                         }
                                     }
@@ -279,62 +302,63 @@ struct ContentView: View {
                                 }
                                 .disabled(!mgr.dsready || mgr.vfsready || mgr.vfsrunning || !mgr.sbxready)
 
-                            if mgr.vfsready && mgr.sbxready {
-                                NavigationLink("Tweaks") {
-                                    List {
-                                        if !showfmintabs {
-                                            NavigationLink("File Manager") {
-                                                SantanderView(startPath: "/")
-                                            }
-                                        }
-
-                                        NavigationLink("Font Overwrite") {
-                                            FontPicker(mgr: mgr)
-                                        }
-
-                                        NavigationLink("Card Overwrite") {
-                                            CardView()
-                                        }
-
-                                        NavigationLink("Custom Overwrite") {
-                                            CustomView(mgr: mgr)
-                                        }
-
-                                        NavigationLink("MobileGestalt") {
-                                            EditorView()
-                                        }
-
-                                        NavigationLink("3 App Bypass") {
-                                            AppsView(mgr: mgr)
-                                        }
-
-                                        NavigationLink("VarClean") {
-                                            VarCleanView()
-                                        }
-
-                                        NavigationLink("Whitelist") {
-                                            WhitelistView()
-                                        }
-
-                                        NavigationLink("DirtyZero") {
-                                            ZeroView(mgr: mgr)
-                                        }
-                                        
-                                        NavigationLink("DarkBoard") {
-                                            DarkBoardView()
-                                        }
-
-                                        if 1 == 2 {
-                                            NavigationLink("Control Center") {
-                                                CCView()
+                                if mgr.vfsready && mgr.sbxready {
+                                    NavigationLink("Tweaks") {
+                                        List {
+                                            if !showfmintabs {
+                                                NavigationLink("File Manager") {
+                                                    SantanderView(startPath: "/")
+                                                }
                                             }
 
-                                            NavigationLink("Passcode Theme") {
-                                                PasscodeView(mgr: mgr)
+                                            NavigationLink("Font Overwrite") {
+                                                FontPicker(mgr: mgr)
+                                            }
+
+                                            NavigationLink("Card Overwrite") {
+                                                CardView()
+                                            }
+
+                                            NavigationLink("Custom Overwrite") {
+                                                CustomView(mgr: mgr)
+                                            }
+
+                                            NavigationLink("MobileGestalt") {
+                                                EditorView()
                                             }
 
                                             NavigationLink("3 App Bypass") {
                                                 AppsView(mgr: mgr)
+                                            }
+
+                                            NavigationLink("VarClean") {
+                                                VarCleanView()
+                                            }
+
+                                            NavigationLink("Whitelist") {
+                                                WhitelistView()
+                                            }
+
+                                            NavigationLink("DirtyZero") {
+                                                ZeroView(mgr: mgr)
+                                            }
+
+                                            NavigationLink("DarkBoard") {
+                                                DarkBoardView()
+                                            }
+
+                                            if 1 == 2 {
+                                                NavigationLink("Control Center") {
+                                                    CCView()
+                                                }
+
+                                                NavigationLink("Passcode Theme") {
+                                                    PasscodeView(mgr: mgr)
+                                                }
+
+                                                NavigationLink("3 App Bypass") {
+                                                    AppsView(mgr: mgr)
+                                                }
                                             }
                                         }
                                     }
@@ -394,28 +418,7 @@ struct ContentView: View {
                             Text("RemoteCall is still in development and may not work properly 100% of the time.")
                         }
                         
-                        if isdebugged() {
-                            Button {
-                                exit(0)
-                            } label: {
-                                Text("Detach")
-                            }
-                            .foregroundColor(.red)
-                        }
-                    } header: {
-                        Text("RemoteCall")
-                    } footer: {
-                        if let error = mgr.sbProc?.lastError {
-                            Text("RemoteCall error: \(error)")
-                                .foregroundColor(.red)
-                        }
-                        if isdebugged() {
-                            Text("Not available when a debugger is attached.")
-                        }
-                        Text("RemoteCall is still in development and may not work properly 100% of the time.")
-                    }
-                    .disabled(mgr.rcrunning)
-                    #endif
+                        #endif
 
                         Section {
                             if mgr.dsready {
