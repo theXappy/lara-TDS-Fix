@@ -419,7 +419,9 @@ final class RemoteFileIO: ObservableObject {
     /// Fallback: sysctl KERN_PROC_ALL (standard BSD, works post-sbx-escape).
     func listRunningProcesses() -> [RunningProcess] {
         var count: Int32 = 0
-        if let ptr = proclist(nil, &count), count > 0 {
+        if let ptr = proclist(nil, &count, { [weak self] msg in
+            self?.dbg(String(cString: msg))
+        }), count > 0 {
             defer { free_proclist(ptr) }
             let result: [RunningProcess] = (0..<Int(count)).compactMap { i in
                 let e = ptr[i]

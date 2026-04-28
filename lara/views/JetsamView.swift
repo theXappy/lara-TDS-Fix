@@ -383,32 +383,9 @@ struct JetsamView: View {
         guard !loading else { return }
         loading = true
         DispatchQueue.global(qos: .userInitiated).async {
-            var result: [JetsamProcess] = []
-            var count: Int32 = 0
-            if let ptr = proclist(nil, &count), count > 0 {
-                for i in 0..<Int(count) {
-                    let e = ptr[i]
-                    guard e.pid > 1 else { continue }
-                    let name = withUnsafeBytes(of: e.name) { raw -> String in
-                        let b   = raw.bindMemory(to: UInt8.self)
-                        let end = b.firstIndex(of: 0) ?? b.endIndex
-                        return String(bytes: b[..<end], encoding: .utf8) ?? "?"
-                    }
-                    guard !name.isEmpty else { continue }
-                    let existing = self.processes.first(where: { $0.pid == e.pid })
-                    var p = JetsamProcess(pid: e.pid, uid: e.uid, name: name)
-                    if let ex = existing, ex.isProtected {
-                        p.isProtected = true
-                        p.targetBand  = ex.targetBand
-                        p.limitMB     = ex.limitMB
-                        p.origBand    = ex.origBand
-                    }
-                    result.append(p)
-                }
-                free_proclist(ptr)
-            }
+            let result: [JetsamProcess] = []
             DispatchQueue.main.async {
-                self.processes = result.sorted { $0.name.lowercased() < $1.name.lowercased() }
+                self.processes = result
                 self.loading   = false
             }
         }
