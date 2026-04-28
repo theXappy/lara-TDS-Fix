@@ -3,7 +3,15 @@
 //  lara
 //
 //  Created by ruter on 29.03.26.
+//  modified and fixed by claude, implemented by TheDiamondSquidy
 //
+//  Write notes:
+//  - Direct write works post-sbx-escape for most /var paths
+//  - VFS overwrite works for existing inodes only (no new file creation)
+//  - Creating new files in /private/var/db/MobileIdentityData/ requires
+//    mobileidentityd's MAC context — needs remotecall, not wired here yet
+//  - On a clean device the Banned plists simply don't exist, so patch is
+//    disabled until a refresh finds them
 
 import SwiftUI
 import Darwin
@@ -17,15 +25,25 @@ struct WhitelistView: View {
         let path: String
     }
 
+    private enum ReadResult {
+        case notPresent      // file absent or empty plist — device is clean
+        case content(String) // file present with meaningful content
+        case readError(String)
+    }
+
     private let files: [wlfile] = [
-        .init(name: "Rejections.plist", path: "/private/var/db/MobileIdentityData/Rejections.plist"),
-        .init(name: "AuthListBannedUpps.plist", path: "/private/var/db/MobileIdentityData/AuthListBannedUpps.plist"),
+        .init(name: "Rejections.plist",            path: "/private/var/db/MobileIdentityData/Rejections.plist"),
+        .init(name: "AuthListBannedUpps.plist",     path: "/private/var/db/MobileIdentityData/AuthListBannedUpps.plist"),
         .init(name: "AuthListBannedCdHashes.plist", path: "/private/var/db/MobileIdentityData/AuthListBannedCdHashes.plist"),
     ]
 
-    @State private var contents: [String: String] = [:]
+    @State private var results: [String: ReadResult] = [:]
     @State private var status: String?
-    @State private var patching = false
+    @State private var working = false
+
+    private var anyFilePresent: Bool {
+        results.values.contains { if case .content = $0 { return true }; return false }
+    }
 
     var body: some View {
         NavigationStack {
@@ -34,35 +52,64 @@ struct WhitelistView: View {
                     Button {
                         loadall()
                     } label: {
-                        if patching {
-                            HStack {
-                                ProgressView()
-                                Text("Working...")
-                            }
+                        if working {
+                            HStack { ProgressView(); Text("Working...") }
                         } else {
                             Text("Refresh")
                         }
                     }
-                    .disabled(!mgr.sbxready || patching)
+                    .disabled(!mgr.sbxready || working)
 
                     Button("Patch (Empty Plist)") {
                         patchall()
                     }
-                    .disabled(!mgr.sbxready || patching)
+                    .disabled(!mgr.sbxready || working || !anyFilePresent)
                 } header: {
                     Text("Actions")
                 } footer: {
-                    Text("Overwrites MobileIdentityData blacklist files with an empty plist.")
+                    if !results.isEmpty && !anyFilePresent {
+                        Text("No blacklist entries found — this device does not appear to be flagged.")
+                    } else {
+                        Text("Overwrites MobileIdentityData blacklist files with an empty plist.")
+                    }
                 }
 
                 ForEach(files) { f in
                     Section {
-                        ScrollView {
-                            Text(contents[f.path] ?? "(not loaded)")
+                        switch results[f.path] {
+                        case .none:
+                            Text("(not loaded)")
                                 .font(.system(size: 13, design: .monospaced))
-                                .textSelection(.enabled)
+                                .foregroundColor(.secondary)
+
+                        case .notPresent:
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark.shield.fill")
+                                    .foregroundColor(.green)
+                                Text("Not present — device is not blacklisted")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundColor(.green)
+                            }
+
+                        case .content(let text):
+                            ScrollView {
+                                Text(text)
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            .frame(minHeight: 120)
+
+                        case .readError(let reason):
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("(failed to read)")
+                                    .font(.system(size: 13, design: .monospaced))
+                                    .foregroundColor(.red)
+                                Text(reason)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                            }
                         }
-                        .frame(minHeight: 120)
                     } header: {
                         Text(f.name)
                     } footer: {
@@ -77,121 +124,111 @@ struct WhitelistView: View {
                 Text(status ?? "")
             }
             .onAppear {
-                if mgr.sbxready {
-                    loadall()
-                }
+                if mgr.sbxready { loadall() }
             }
         }
     }
 
+    // MARK: - Actions
+
     private func loadall() {
-        guard mgr.sbxready else {
-            status = "sandbox escape not ready"
-            return
-        }
-        patching = true
-        defer { patching = false }
-        var next: [String: String] = [:]
-        for f in files {
-            guard let data = sbxread(path: f.path, maxSize: 2 * 1024 * 1024) else {
-                next[f.path] = "(failed to read)"
-                continue
-            }
-            next[f.path] = render(data: data)
-        }
-        contents = next
+        guard mgr.sbxready else { status = "sandbox escape not ready"; return }
+        working = true
+        defer { working = false }
+        var next: [String: ReadResult] = [:]
+        for f in files { next[f.path] = read(path: f.path) }
+        results = next
     }
 
     private func patchall() {
-        guard mgr.sbxready else {
-            status = "sandbox escape not ready"
+        guard mgr.sbxready, anyFilePresent else {
+            status = "nothing to patch — no blacklist entries present"
             return
         }
-        patching = true
-        defer { patching = false }
+        working = true
+        defer { working = false }
 
-        guard let data = try? PropertyListSerialization.data(
-            fromPropertyList: [:],
-            format: .xml,
-            options: 0
-        ) else {
+        guard let empty = try? PropertyListSerialization.data(fromPropertyList: [:], format: .xml, options: 0) else {
             status = "failed to build empty plist"
             return
         }
 
         var failures: [String] = []
-
         for f in files {
-            let result = sbxwrite(path: f.path, data: data)
-            if !result.hasPrefix("ok") {
-                failures.append("\(f.name): \(result)")
-            }
+            guard case .content = results[f.path] else { continue }
+            let result = write(path: f.path, data: empty)
+            if !result.hasPrefix("ok") { failures.append("\(f.name): \(result)") }
         }
 
-        if failures.isEmpty {
-            status = "Patched all files!"
-        } else {
-            status = "Failed to patch: \(failures.joined(separator: ", "))"
-        }
-
+        status = failures.isEmpty ? "Patched all files!" : "Failed: \(failures.joined(separator: ", "))"
         loadall()
     }
 
-    private func sbxread(path: String, maxSize: Int) -> Data? {
-        do {
-            let url = URL(fileURLWithPath: path)
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            if data.count > maxSize {
-                return data.prefix(maxSize)
-            }
-            return data
-        } catch {
-            return nil
+    // MARK: - I/O
+
+    /// Reads a file, trying direct access then VFS.
+    /// Returns .notPresent when the file is absent or its plist is empty —
+    /// an empty plist is indistinguishable from no ban having been recorded.
+    private func read(path: String) -> ReadResult {
+        // Check existence via both direct stat and VFS before attempting a read
+        let exists = FileManager.default.fileExists(atPath: path)
+            || (mgr.vfsready && mgr.vfsread(path: path, maxSize: 1) != nil)
+        guard exists else { return .notPresent }
+
+        // Attempt 1: direct read (works post-sbx-escape for most paths)
+        let data: Data?
+        if let d = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) {
+            data = d
+        } else if mgr.vfsready {
+            // Attempt 2: VFS — confirmed working for this directory
+            data = mgr.vfsread(path: path, maxSize: 2 * 1024 * 1024)
+        } else {
+            data = nil
         }
+
+        guard let data else {
+            return .readError("errno=\(errno) \(String(cString: strerror(errno)))\(mgr.vfsready ? " | vfs returned nil" : " | vfs not ready")")
+        }
+
+        // An empty plist means no bans — treat same as absent
+        if let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
+            let isEmpty = (plist as? [AnyHashable: Any])?.isEmpty == true
+                       || (plist as? [Any])?.isEmpty == true
+            if isEmpty { return .notPresent }
+        }
+
+        return .content(render(data: data))
     }
 
-    private func sbxwrite(path: String, data: Data) -> String {
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        if fd == -1 {
-            return vfsfallback(path: path, data: data, reason: "open failed: errno=\(errno) \(String(cString: strerror(errno)))")
-        }
-        defer { close(fd) }
-
-        let result = data.withUnsafeBytes { ptr in
-            write(fd, ptr.baseAddress, ptr.count)
-        }
-
-        if result == -1 {
-            return vfsfallback(path: path, data: data, reason: "write failed: errno=\(errno) \(String(cString: strerror(errno)))")
+    /// Writes data, trying direct I/O then VFS overwrite.
+    /// Both only work on existing inodes — creating new files in
+    /// MobileIdentityData requires remotecall into mobileidentityd.
+    private func write(path: String, data: Data) -> String {
+        // Attempt 1: direct write (post-sbx-escape)
+        let fd = open(path, O_WRONLY | O_TRUNC, 0o644)   // no O_CREAT — we only patch existing files
+        if fd != -1 {
+            let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+            close(fd)
+            if n == data.count { return "ok (\(n) bytes direct)" }
         }
 
-        return "ok (\(result) bytes)"
-    }
-
-    private func vfsfallback(path: String, data: Data, reason: String) -> String {
+        // Attempt 2: VFS overwrite (existing inodes only, confirmed working in this dir)
         guard mgr.vfsready else {
-            return reason + " | vfs not ready"
+            return "open failed: errno=\(errno) \(String(cString: strerror(errno))) | vfs not ready"
         }
         let ok = mgr.vfsoverwritewithdata(target: path, data: data)
-        return ok ? "ok (vfs overwrite)" : reason + " | vfs overwrite failed"
+        return ok ? "ok (vfs overwrite)" : "direct and vfs both failed for \(path)"
     }
+
+    // MARK: - Rendering
 
     private func render(data: Data) -> String {
         if let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
            let xmlData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
-           let xml = String(data: xmlData, encoding: .utf8) {
-            return xml
-        }
-
-        if let s = String(data: data, encoding: .utf8) {
-            return s
-        }
-
-        let maxBytes = min(data.count, 4096)
-        let hex = data.prefix(maxBytes).map { String(format: "%02x", $0) }.joined(separator: " ")
-        if data.count > maxBytes {
-            return hex + "\n... (\(data.count) bytes total)"
-        }
-        return hex
+           let xml = String(data: xmlData, encoding: .utf8) { return xml }
+        if let s = String(data: data, encoding: .utf8) { return s }
+        let cap = min(data.count, 4096)
+        let hex = data.prefix(cap).map { String(format: "%02x", $0) }.joined(separator: " ")
+        return data.count > cap ? hex + "\n... (\(data.count) bytes total)" : hex
     }
 }
