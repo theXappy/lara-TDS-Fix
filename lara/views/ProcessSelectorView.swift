@@ -38,7 +38,7 @@ private enum ProcSort: String, CaseIterable, Identifiable {
 // MARK: - Unified row model
 
 private struct UnifiedProcess: Identifiable {
-    let id           = UUID()
+    var id:          String { name }
     let name:        String
     let isRecommended: Bool
     let isRunning:   Bool
