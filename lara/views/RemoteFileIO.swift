@@ -145,7 +145,11 @@ final class RemoteFileIO: ObservableObject {
     static let shared = RemoteFileIO()
 
     // Published state
-    @Published private(set) var pool: [String: RCPoolEntry] = [:]
+    @Published private(set) var pool:     [String: RCPoolEntry] = [:]
+    /// Read-only snapshot of `pool`, always updated on the main thread.
+    /// SwiftUI views must read this instead of `pool` to avoid blocking
+    /// the main thread on `poolLock` while background inits hold it.
+    @Published private(set) var poolSnap: [String: RCPoolEntry] = [:]
     @Published private(set) var log:  [RCIOLogEntry] = []
     @Published var bookmarks: [RCBookmark] = []
 
@@ -202,6 +206,7 @@ final class RemoteFileIO: ObservableObject {
         for p in Self.recommendedProcesses {
             pool[p] = RCPoolEntry(process: p, state: .uninitialized, rc: nil)
         }
+        poolSnap = pool
         loadBookmarks()
         dbg("pool initialised with \(pool.count) slots: \(Self.recommendedProcesses.joined(separator: ", "))")
     }
@@ -1122,16 +1127,17 @@ final class RemoteFileIO: ObservableObject {
         dbg("\(process) failed: \(reason)")
     }
 
-    /// Returns a lock-protected snapshot of the process pool.
-    /// Call from any thread; safe to read without holding poolLock.
-    func poolSnapshot() -> [String: RCPoolEntry] {
-        poolLock.lock()
-        defer { poolLock.unlock() }
-        return pool
-    }
-
     private func publish() {
-        DispatchQueue.main.async { self.objectWillChange.send() }
+        // Capture a snapshot under the lock, then hand it to the main thread.
+        // The main thread only ever reads poolSnap — never pool — so it never
+        // needs to acquire poolLock and can never block on a background init.
+        poolLock.lock()
+        let snap = pool
+        poolLock.unlock()
+        DispatchQueue.main.async {
+            self.poolSnap = snap
+            self.objectWillChange.send()
+        }
     }
 
     private func appendLog(op: String, path: String, result: RCIOResult) {
