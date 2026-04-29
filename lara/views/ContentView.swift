@@ -3,9 +3,9 @@
 //  lara — TDS fork
 //
 //  4-tab layout:
-//    Tab 1  File Manager   — RC FM shown directly; Lara FM reachable via toolbar
+//    Tab 1  Tweaks         — fork-only features (Jetsam, Process Inspector)
 //    Tab 2  Home           — verbatim upstream, not modified
-//    Tab 3  Tweaks         — fork-only features (Jetsam, Process Inspector)
+//    Tab 3  File Manager   — RC FM shown directly; Lara FM reachable via toolbar
 //    Tab 4  Logs           — lara operation log
 //
 //  Single-level NavigationStack per tab — no hub screens, no double nav bars.
@@ -20,17 +20,21 @@ struct ContentView: View {
     @State private var hasoffsets     = true
     @State private var showsettings   = false
     @State private var selectedmethod: method = .hybrid
+    // Debug: process sheet isolation
+    @State private var dbgBlankSheet = false
+    @State private var dbgProcSheet  = false
+    @State private var dbgLabel      = "—"
+    @State private var dbgRunning    = false
 
     var body: some View {
         TabView {
 
-            // ── Tab 1: File Manager ──────────────────────────────────────────
-            // RC FM is the primary view. Lara FM is accessed via the toolbar
-            // "Lara FM" button (NavigationLink push). One nav bar, no hub screen.
+            // ── Tab 1: Fork Tweaks ───────────────────────────────────────────
+            // Only fork-specific features — no upstream tweaks here.
             NavigationStack {
-                FileManagerView()
+                ForkTweaksView(mgr: mgr)
             }
-            .tabItem { Label("Files", systemImage: "folder.badge.gear") }
+            .tabItem { Label("Tweaks", systemImage: "wrench.and.screwdriver") }
 
             // ── Tab 2: Home ─────────────────────────────────────────────────
             // Verbatim upstream — do NOT edit this section.
@@ -340,6 +344,73 @@ struct ContentView: View {
                         } header: {
                             Text("Other")
                         }
+
+                        // ── Debug: process sheet isolation ──────────────────
+                        Section {
+                            Button("1 · Open blank sheet") {
+                                dbgLabel = "—"
+                                dbgBlankSheet = true
+                            }
+
+                            Button("2 · sysctl KERN_PROC_ALL") {
+                                dbgLabel = "running…"; dbgRunning = true
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+                                    var size = 0
+                                    let r = sysctl(&mib, 4, nil, &size, nil, 0)
+                                    let count = size / MemoryLayout<kinfo_proc>.stride
+                                    DispatchQueue.main.async {
+                                        dbgRunning = false
+                                        dbgLabel = r == 0 ? "✓ sysctl \(count) entries" : "✗ errno \(errno)"
+                                    }
+                                }
+                            }
+
+                            Button("3 · proclist() kernel primitive") {
+                                dbgLabel = "running…"; dbgRunning = true
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    var count: Int32 = 0
+                                    let ptr = proclist(nil, &count)
+                                    let n = Int(count)
+                                    if let p = ptr { free_proclist(p) }
+                                    DispatchQueue.main.async {
+                                        dbgRunning = false
+                                        dbgLabel = ptr != nil ? "✓ proclist \(n) procs" : "✗ proclist nil (count=\(n))"
+                                    }
+                                }
+                            }
+
+                            Button("4 · listRunningProcesses()") {
+                                dbgLabel = "running…"; dbgRunning = true
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    let procs = RemoteFileIO.shared.listRunningProcesses()
+                                    DispatchQueue.main.async {
+                                        dbgRunning = false
+                                        dbgLabel = "✓ \(procs.count) procs"
+                                    }
+                                }
+                            }
+
+                            Button("5 · Open ProcessSelectorView") {
+                                dbgLabel = "—"
+                                dbgProcSheet = true
+                            }
+
+                            if dbgRunning {
+                                HStack(spacing: 6) {
+                                    ProgressView().scaleEffect(0.7)
+                                    Text("running…")
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
+                            } else {
+                                Text(dbgLabel)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                        } header: {
+                            Text("Debug: Process Sheet")
+                        }
                     }
                 }
                 .navigationTitle("lara")
@@ -348,15 +419,29 @@ struct ContentView: View {
                         Button { showsettings = true } label: { Image(systemName: "gear") }
                     }
                 }
+                .sheet(isPresented: $dbgBlankSheet) {
+                    VStack(spacing: 20) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 48)).foregroundColor(.green)
+                        Text("Sheet OK — presentation works")
+                            .font(.headline)
+                        Button("Dismiss") { dbgBlankSheet = false }
+                    }
+                    .padding()
+                }
+                .sheet(isPresented: $dbgProcSheet) {
+                    ProcessSelectorView(pathContext: "/", selectedOverride: .constant(nil))
+                }
             }
             .tabItem { Label("Home", systemImage: "house") }
 
-            // ── Tab 3: Fork Tweaks ───────────────────────────────────────────
-            // Only fork-specific features — no upstream tweaks here.
+            // ── Tab 3: File Manager ──────────────────────────────────────────
+            // RC FM is the primary view. Lara FM is accessed via the toolbar
+            // "Lara FM" button (NavigationLink push). One nav bar, no hub screen.
             NavigationStack {
-                ForkTweaksView(mgr: mgr)
+                FileManagerView()
             }
-            .tabItem { Label("Tweaks", systemImage: "wrench.and.screwdriver") }
+            .tabItem { Label("Files", systemImage: "folder.badge.gear") }
 
             // ── Tab 4: Logs ──────────────────────────────────────────────────
             NavigationStack {
