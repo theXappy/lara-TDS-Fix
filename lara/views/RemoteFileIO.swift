@@ -1122,6 +1122,14 @@ final class RemoteFileIO: ObservableObject {
         dbg("\(process) failed: \(reason)")
     }
 
+    /// Returns a lock-protected snapshot of the process pool.
+    /// Call from any thread; safe to read without holding poolLock.
+    func poolSnapshot() -> [String: RCPoolEntry] {
+        poolLock.lock()
+        defer { poolLock.unlock() }
+        return pool
+    }
+
     private func publish() {
         DispatchQueue.main.async { self.objectWillChange.send() }
     }

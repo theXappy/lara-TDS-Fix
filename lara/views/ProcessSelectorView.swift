@@ -98,6 +98,11 @@ struct ProcessSelectorView: View {
     // MARK: - Unified data
 
     private var allUnified: [UnifiedProcess] {
+        // Take a single lock-protected snapshot so the main thread never races
+        // with background threads that write to rcio.pool under poolLock.
+        // Accessing rcio.pool directly during iteration caused corrupted hash-table
+        // probing (infinite loop on main thread) when search was cleared.
+        let snap = rcio.poolSnapshot()
         var seen   = Set<String>()
         var result = [UnifiedProcess]()
 
@@ -110,7 +115,7 @@ struct ProcessSelectorView: View {
                 isRunning:     running != nil,
                 pid:           running?.pid,
                 uid:           running?.uid,
-                poolEntry:     rcio.pool[name]
+                poolEntry:     snap[name]
             ))
         }
 
@@ -122,7 +127,7 @@ struct ProcessSelectorView: View {
                 isRunning:     true,
                 pid:           proc.pid,
                 uid:           proc.uid,
-                poolEntry:     rcio.pool[proc.name]
+                poolEntry:     snap[proc.name]
             ))
         }
         return result
