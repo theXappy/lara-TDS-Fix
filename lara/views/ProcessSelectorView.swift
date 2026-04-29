@@ -98,11 +98,9 @@ struct ProcessSelectorView: View {
     // MARK: - Unified data
 
     private var allUnified: [UnifiedProcess] {
-        var seen   = Set<String>()
         var result = [UnifiedProcess]()
 
         for name in RemoteFileIO.recommendedProcesses {
-            seen.insert(name)
             let running = runningProcs.first { $0.name == name }
             result.append(UnifiedProcess(
                 name:          name,
@@ -111,18 +109,6 @@ struct ProcessSelectorView: View {
                 pid:           running?.pid,
                 uid:           running?.uid,
                 poolEntry:     rcio.pool[name]
-            ))
-        }
-
-        for proc in runningProcs where proc.pid > 1 && !seen.contains(proc.name) {
-            seen.insert(proc.name)
-            result.append(UnifiedProcess(
-                name:          proc.name,
-                isRecommended: false,
-                isRunning:     true,
-                pid:           proc.pid,
-                uid:           proc.uid,
-                poolEntry:     rcio.pool[proc.name]
             ))
         }
         return result
