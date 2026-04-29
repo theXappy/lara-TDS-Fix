@@ -336,6 +336,7 @@ struct ProcessSelectorView: View {
                     }
                     .listStyle(.insetGrouped)
                     .refreshable { refreshRunning() }
+                    .animation(.none, value: searchText)
                 }
             }
         }
