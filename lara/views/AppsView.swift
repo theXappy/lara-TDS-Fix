@@ -10,7 +10,7 @@ import Darwin
 
 struct AppsView: View {
     @ObservedObject var mgr: laramgr
-    @AppStorage("selectedmethod") private var selectedmethod: method = .vfs
+    @AppStorage("selectedmethod") private var selectedmethod: method = .hybrid
     
     @State private var scannedapps: [scannedapp] = []
     @State private var iconcache: [String: UIImage] = [:]

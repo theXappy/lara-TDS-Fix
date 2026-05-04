@@ -21,9 +21,7 @@ struct lara: App {
     @ObservedObject private var mgr = laramgr.shared
     @Environment(\.scenePhase) private var scenePhase
     @State var showunsupported: Bool = false
-    @State private var selectedtab: Int = 1
     private let keepalivekey = "keepalive"
-    @AppStorage("showfmintabs") private var showfmintabs: Bool = true
     @AppStorage("selectedmethod") private var selectedmethod: method = .hybrid
 
     init() {
@@ -33,7 +31,7 @@ struct lara: App {
         method_exchangeImplementations(origMethod, fixMethod)
         
         if UserDefaults.standard.string(forKey: "selectedmethod") == nil {
-            UserDefaults.standard.set(method.sbx.rawValue, forKey: "selectedmethod")
+            UserDefaults.standard.set(method.hybrid.rawValue, forKey: "selectedmethod")
         }
         
         if g_isunsupported {
@@ -57,25 +55,7 @@ struct lara: App {
 
     var body: some Scene {
         WindowGroup {
-            TabView(selection: $selectedtab) {
-                SantanderView(startPath: "/")
-                    .tabItem {
-                        Image(systemName: "folder.fill")
-                    }
-                    .tag(0)
-                
-                ContentView()
-                    .tabItem {
-                        Image(systemName: "ant.fill")
-                    }
-                    .tag(1)
-                
-                LogsView(logger: globallogger)
-                    .tabItem {
-                        Image(systemName: "doc.text.fill")
-                    }
-                    .tag(2)
-            }
+            ContentView()
             .onAppear {
                 if g_isunsupported {
                     showunsupported = true

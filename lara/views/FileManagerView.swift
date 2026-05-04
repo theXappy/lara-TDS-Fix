@@ -548,8 +548,8 @@ struct FileManagerView: View {
         let fullPath = (path == "/" ? "" : path) + "/" + entry.name
 
         HStack(spacing: 10) {
-            Image(systemName: entry.isDir ? "folder.fill" : fileIcon(for: entry.name))
-                .foregroundColor(entry.isDir ? .yellow : .secondary)
+            Image(systemName: entry.isDir ? (entry.size == -2 ? "folder.fill.badge.questionmark" : "folder.fill") : fileIcon(for: entry.name))
+                .foregroundColor(entry.isDir ? (entry.size == -2 ? .orange : .yellow) : .secondary)
                 .frame(width: 22)
 
             VStack(alignment: .leading, spacing: 1) {
@@ -577,7 +577,7 @@ struct FileManagerView: View {
             Spacer()
 
             if !entry.isDir {
-                Button { openPreview(path: fullPath) } label: {
+                Button { openPreview(path: fullPath, size: entry.size) } label: {
                     Image(systemName: "eye")
                 }
                 .buttonStyle(.borderless)
@@ -702,7 +702,7 @@ struct FileManagerView: View {
         listSource = ""
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let (e, src) = self.rcio.listDir(path: targetPath)
+            let (e, src) = self.rcio.listDir(path: targetPath, override: self.processOverride)
             DispatchQueue.main.async {
                 guard self.loadGeneration == gen else { return }
                 self.entries    = e
@@ -735,13 +735,15 @@ struct FileManagerView: View {
         }
     }
 
-    private func openPreview(path: String) {
+    private func openPreview(path: String, size: Int64) {
         previewPath   = path
         previewResult = nil
         showPreview   = true
 
+        let maxSize = size > 0 ? Int(size) : 8 * 1024 * 1024
+
         DispatchQueue.global(qos: .userInitiated).async {
-            let (data, result) = rcio.read(path: path, maxSize: 256 * 1024,
+            let (data, result) = rcio.read(path: path, maxSize: maxSize,
                                            override: self.processOverride)
             DispatchQueue.main.async {
                 self.previewResult = (data, result)
@@ -915,6 +917,12 @@ struct FilePreviewSheet: View {
     enum PreviewMode: String, CaseIterable { case auto, text, hex, plist }
 
     private var filename: String { URL(fileURLWithPath: path).lastPathComponent }
+
+    init(path: String, data: Data?, result: RCIOResult) {
+        self.path = path
+        self.data = data
+        self.result = result
+    }
 
     var body: some View {
         NavigationView {

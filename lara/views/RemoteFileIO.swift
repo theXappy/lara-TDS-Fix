@@ -5,7 +5,7 @@
 //  RemoteCall-backed file I/O engine.
 //
 //  Process pool and routing:
-//    mobile_backup_agent2  mobile + backup entitlement  (widest /var/mobile reach; iOS 17+)
+//    BackupAgent2          mobile + backup entitlement  (widest /var/mobile reach; iOS 17+)
 //    mobile_backup_agent   mobile + backup entitlement  (iOS ≤16)
 //    SpringBoard           mobile uid                   (default /var/mobile/**)
 //    configd               root uid                     (/var/db/*, /var/root/*)
@@ -35,7 +35,7 @@
 //
 //  Known iOS version differences:
 //    iOS ≤16:  backup daemon = "mobile_backup_agent"
-//    iOS 17+:  backup daemon = "mobile_backup_agent2"
+//    iOS 17+:  backup daemon = "BackupAgent2" (binary at /usr/libexec/BackupAgent2)
 //
 
 import Foundation
@@ -152,6 +152,14 @@ final class RemoteFileIO: ObservableObject {
     private let mgr      = laramgr.shared
     private let poolLock  = NSLock()
 
+    // Cached 1MB remote buffer per RC connection (keyed by trojanMem address).
+    // Re-using the same mmap'd region avoids a kread VA→PA stale-cache bug
+    // that causes remoteRead to return stale data after munmap+mmap at the
+    // same virtual address.
+    private var remoteBufCache: [UInt64: UInt64] = [:]   // trojanMem → remoteBuf
+    private let remoteBufLock = NSLock()
+    private let remoteBufSize = 1024 * 1024  // 1MB, must match chunkSize
+
     // VFS listing change-detection: stores the path and entry names from the
     // last accepted VFS listing.  If VFS returns the exact same set of names
     // for a DIFFERENT path, it's returning stale namecache data — discard it.
@@ -164,9 +172,10 @@ final class RemoteFileIO: ObservableObject {
     // MARK: - iOS version–aware process names
 
     /// Returns the correct backup agent process name for the running iOS version.
+    /// iOS 17+ uses BackupAgent2 (/usr/libexec/BackupAgent2), launchd label com.apple.mobilebackup2.
     static var backupDaemonName: String {
         let v = ProcessInfo.processInfo.operatingSystemVersion
-        return v.majorVersion >= 17 ? "mobile_backup_agent2" : "mobile_backup_agent"
+        return v.majorVersion >= 17 ? "BackupAgent2" : "mobile_backup_agent"
     }
 
     // MARK: - Pool configuration
@@ -176,6 +185,7 @@ final class RemoteFileIO: ObservableObject {
         [
             backupDaemonName,   // widest /var/mobile write surface
             "SpringBoard",
+            "lockdownd",        // service broker — needed for BA2 XPC activation tests
             "configd",
             "mobileidentityd",
             "securityd",
@@ -192,7 +202,7 @@ final class RemoteFileIO: ObservableObject {
     /// launchd service labels for kickstart.
     private static var launchdServices: [String: String] {
         [
-            backupDaemonName:    "com.apple.mobile.mobile_backup_agent2",
+            backupDaemonName:    "com.apple.mobilebackup2",
             "mobileidentityd":   "com.apple.mobileidentityd",
             "dataaccessd":       "com.apple.dataaccessd",
         ]
@@ -210,7 +220,7 @@ final class RemoteFileIO: ObservableObject {
 
     /// Verbose debug log — always goes to the global logger and mgr.log.
     /// Every file I/O event, RC init, spawn, failure should funnel through here.
-    private func dbg(_ msg: String) {
+    func dbg(_ msg: String) {
         let tagged = "(rcio) \(msg)"
         mgr.logmsg(tagged)
     }
@@ -265,8 +275,12 @@ final class RemoteFileIO: ObservableObject {
         let entry = pool[process]
         poolLock.unlock()
 
-        if let rc = entry?.rc, entry?.state.isReady == true { return rc }
-        if case .failed = entry?.state { return nil }
+        if let rc = entry?.rc, entry?.state.isReady == true {
+            return rc
+        }
+        if case .failed = entry?.state {
+            return nil
+        }
 
         guard mgr.dsready else {
             markFailed(process: process, reason: "darksword not ready — run the exploit first")
@@ -274,8 +288,10 @@ final class RemoteFileIO: ObservableObject {
         }
 
         // Check if process is running; spawn if needed and allowed
-        if spawnIfNeeded, Self.spawnNeeded.contains(process), !isRunning(process) {
-            dbg("\(process) not running — attempting kickstart spawn")
+        let running = isRunning(process)
+        let needsSpawn = Self.spawnNeeded.contains(process)
+
+        if spawnIfNeeded, needsSpawn, !running {
             markPoolState(process, .spawning)
             let ok = kickstart(service: process)
             if !ok {
@@ -286,9 +302,9 @@ final class RemoteFileIO: ObservableObject {
             var appeared = false
             for attempt in 1...8 {
                 Thread.sleep(forTimeInterval: 0.5)
-                if isRunning(process) {
+                let nowRunning = isRunning(process)
+                if nowRunning {
                     appeared = true
-                    dbg("\(process) appeared after \(attempt * 500)ms")
                     break
                 }
             }
@@ -296,15 +312,38 @@ final class RemoteFileIO: ObservableObject {
                 markFailed(process: process, reason: "daemon did not appear within 4s after kickstart")
                 return nil
             }
-        } else if !Self.spawnNeeded.contains(process), !isRunning(process) {
+        } else if !needsSpawn, !running {
             markFailed(process: process, reason: "process '\(process)' is not running; use Spawn to start it")
             return nil
         }
 
         markPoolState(process, .initializing)
-        dbg("RC init starting for \(process)...")
 
         guard let rc = RemoteCall(process: process, useMigFilterBypass: false) else {
+            // RC couldn't find the process — if it's a spawnNeeded daemon, try kickstart + retry once
+            if spawnIfNeeded, Self.spawnNeeded.contains(process) {
+                let ok = kickstart(service: process)
+                if ok {
+                    // Wait for daemon to appear
+                    var appeared = false
+                    for _ in 1...8 {
+                        Thread.sleep(forTimeInterval: 0.5)
+                        if isRunning(process) {
+                            appeared = true
+                            break
+                        }
+                    }
+                    // Retry RC init
+                    if let rc2 = RemoteCall(process: process, useMigFilterBypass: false) {
+                        let pid = Int32(truncatingIfNeeded: callIn(rc: rc2, name: "getpid", args: []))
+                        poolLock.lock()
+                        pool[process] = RCPoolEntry(process: process, state: .ready(pid: pid), rc: rc2)
+                        poolLock.unlock()
+                        publish()
+                        return rc2
+                    }
+                }
+            }
             markFailed(process: process, reason: "RemoteCall init returned nil — process may have exited")
             return nil
         }
@@ -353,7 +392,7 @@ final class RemoteFileIO: ObservableObject {
     // MARK: - Spawn / kickstart
 
     /// Spawns a launchd service by running `launchctl kickstart` inside SpringBoard's RC session.
-    /// Tries the system domain first, then the user/501 domain.
+    /// Tries the user/501 domain first, then the system domain.
     @discardableResult
     func kickstart(service: String) -> Bool {
         let serviceLabel = Self.launchdServices[service] ?? service
@@ -375,8 +414,8 @@ final class RemoteFileIO: ObservableObject {
         }
 
         let candidates = [
-            "system/\(serviceLabel)",
             "user/501/\(serviceLabel)",
+            "system/\(serviceLabel)",
         ]
 
         for label in candidates {
@@ -389,7 +428,7 @@ final class RemoteFileIO: ObservableObject {
                 rc.remote_write(trojan + off, from: &val, size: 8)
             }
 
-            ws(0x000, "/bin/launchctl")
+            ws(0x000, "/usr/bin/launchctl")
             ws(0x040, "launchctl")
             ws(0x060, "kickstart")
             ws(0x070, "-k")
@@ -403,8 +442,7 @@ final class RemoteFileIO: ObservableObject {
             let ret = callIn(rc: rc, name: "posix_spawn", args: [
                 0, trojan + 0x000, 0, 0, trojan + 0x100, 0
             ])
-            let ok = Int32(truncatingIfNeeded: ret) >= 0
-            dbg("kickstart \(label) → \(ok ? "ok (ret=\(ret))" : "failed (ret=\(ret), errno=\(errno))")")
+            let ok = ret == 0
             if ok { return true }
         }
 
@@ -464,7 +502,8 @@ final class RemoteFileIO: ObservableObject {
     }
 
     func isRunning(_ name: String) -> Bool {
-        listRunningProcesses().contains { $0.name == name }
+        let procs = listRunningProcesses()
+        return procs.contains { $0.name == name }
     }
 
     // MARK: - Read
@@ -475,7 +514,6 @@ final class RemoteFileIO: ObservableObject {
     func read(path: String, maxSize: Int = 8 * 1024 * 1024,
               override: String? = nil) -> (data: Data?, result: RCIOResult) {
         let start = Date()
-        dbg("READ \(path) (max=\(maxSize), override=\(override ?? "auto"))")
 
         // Tier 1: direct
         if let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) {
@@ -492,16 +530,16 @@ final class RemoteFileIO: ObservableObject {
         dbg("  → direct failed: errno=\(directErrno) (\(String(cString: strerror(directErrno))))")
 
         // Tier 2: VFS
-        if mgr.vfsready, let data = mgr.vfsread(path: path, maxSize: maxSize) {
-            let r = RCIOResult(ok: true, tier: .vfs, process: nil, bytes: data.count,
-                               duration: -start.timeIntervalSinceNow,
-                               message: "ok (vfs, \(data.count) bytes)",
-                               diagnostic: "direct failed (errno \(directErrno)); vfs read succeeded")
-            dbg("  → vfs ok, \(data.count) bytes")
-            appendLog(op: "read", path: path, result: r)
-            return (data, r)
+        if mgr.vfsready {
+            if let data = mgr.vfsread(path: path, maxSize: maxSize) {
+                let r = RCIOResult(ok: true, tier: .vfs, process: nil, bytes: data.count,
+                                   duration: -start.timeIntervalSinceNow,
+                                   message: "ok (vfs, \(data.count) bytes)",
+                                   diagnostic: "direct failed (errno \(directErrno)); vfs read succeeded")
+                appendLog(op: "read", path: path, result: r)
+                return (data, r)
+            }
         }
-        dbg("  → vfs \(mgr.vfsready ? "returned nil" : "not ready")")
 
         // Tier 3: RC — override → routed → all ready
         var lastDiag = "direct failed (errno \(directErrno)); vfs \(mgr.vfsready ? "returned nil" : "not ready")"
@@ -617,10 +655,8 @@ final class RemoteFileIO: ObservableObject {
     /// prefix and retry — iOS symlinks mean /var and /private/var resolve to the
     /// same physical location but VFS may have indexed the entries under whichever
     /// form it first saw (usually the un-prefixed /var/... form).
-    func listDir(path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String) {
-        dbg("LISTDIR \(path)")
-        if let result = _listDirAtPath(path) {
-            dbg("  → \(result.source): \(result.entries.count) entries")
+    func listDir(path: String, override: String? = nil) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String) {
+        if let result = _listDirAtPath(path, override: override) {
             return result
         }
 
@@ -635,14 +671,11 @@ final class RemoteFileIO: ObservableObject {
         }
 
         if let alt {
-            dbg("  → primary failed, retrying with alt path: \(alt)")
-            if let result = _listDirAtPath(alt) {
-                dbg("  → alt \(result.source): \(result.entries.count) entries")
+            if let result = _listDirAtPath(alt, override: override) {
                 return result
             }
         }
 
-        dbg("  → LISTDIR FAILED for \(path)")
         return ([], "failed")
     }
 
@@ -658,24 +691,48 @@ final class RemoteFileIO: ObservableObject {
     ///
     /// Returns nil if every tier failed for this path, signalling the caller to retry
     /// with the /private-toggled alternate path.
-    private func _listDirAtPath(_ path: String) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String)? {
+    private func _listDirAtPath(_ path: String, override: String? = nil) -> (entries: [(name: String, isDir: Bool, size: Int64)], source: String)? {
         let fm = FileManager.default
 
         // ── Tier 1: FileManager (post-sbx-escape, direct IO) ───────────────
         // This is the same path SantanderView uses in SBX mode.  Most reliable
         // for any directory the sandbox escape grants access to.
         if let names = try? fm.contentsOfDirectory(atPath: path) {
-            let entries: [(String, Bool, Int64)] = names.sorted().map { name in
+            let entries: [(String, Bool, Int64)] = names.sorted(by: { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }).map { name in
                 let full = (path == "/" ? "" : path) + "/" + name
                 var isDir: ObjCBool = false
-                fm.fileExists(atPath: full, isDirectory: &isDir)
+                let exists = fm.fileExists(atPath: full, isDirectory: &isDir)
                 let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? Int64(-1)
-                return (name, isDir.boolValue, size)
+
+                // When fileExists returns false, the entry still EXISTS (contentsOfDirectory
+                // returned its name) but we can't stat it due to MAC policy (errno=1 EPERM
+                // or errno=13 EACCES).  Try lstat() directly — it may succeed where Foundation
+                // wrappers fail.  If lstat also fails, assume directory (MAC-protected items
+                // in /var/mobile/Library are overwhelmingly directories).
+                var finalIsDir = isDir.boolValue
+                var macProtected = false
+                if !exists {
+                    var st = stat()
+                    let lstatRet = lstat(full, &st)
+                    if lstatRet == 0 {
+                        // lstat succeeded — use st_mode to determine type
+                        let mode = st.st_mode & S_IFMT
+                        finalIsDir = (mode == S_IFDIR) || (mode == S_IFLNK)  // treat symlinks as dirs too (they usually point to dirs)
+                    } else {
+                        // lstat also failed — item exists (from contentsOfDirectory) but we
+                        // can't stat it at all.  Assume directory (MAC-protected dirs are the
+                        // common case; files would typically be stat-able).
+                        finalIsDir = true
+                        macProtected = true
+                    }
+                }
+
+                // Use size -2 as sentinel for MAC-protected assumed directories
+                let finalSize: Int64 = macProtected ? -2 : size
+                return (name, finalIsDir, finalSize)
             }
-            dbg("  tier1 filemanager ok: \(entries.count) entries for \(path)")
             return (entries, "filemanager")
         }
-        dbg("  tier1 filemanager failed for \(path)")
 
         // ── Tier 2: VFS ────────────────────────────────────────────────────
         // VFS walks the kernel namecache.  Known bug: stale namecache entries
@@ -702,9 +759,7 @@ final class RemoteFileIO: ObservableObject {
                 return currentNames == prevNames
             }()
 
-            if isStale {
-                dbg("  tier2 vfs DISCARDED: entries identical to previous listing at '\(lastVFSPath ?? "?")' — stale namecache for \(path)")
-            } else {
+            if !isStale {
                 // Accept this listing and update the tracking state
                 lastVFSPath  = path
                 lastVFSNames = currentNames
@@ -714,17 +769,15 @@ final class RemoteFileIO: ObservableObject {
                                           : mgr.vfssize(path: path + "/" + item.name)
                     return (item.name, item.isDir, size)
                 }
-                dbg("  tier2 vfs ok: \(enriched.count) entries for \(path)")
-                return (enriched, "vfs")
+                let sorted = enriched.sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+                return (sorted, "vfs")
             }
-        } else {
-            dbg("  tier2 vfs \(mgr.vfsready ? "returned nil" : "not ready") for \(path)")
         }
 
         // ── Tier 3: RC opendir/readdir ─────────────────────────────────────
         // Privilege-escalated listing via hijacked process.  Reaches dirs that
         // are MAC-protected (Keychains, DPLA, MobileIdentityData, etc.).
-        let candidates = buildCandidates(for: path)
+        let candidates = buildCandidates(for: path, override: override)
         for proc in candidates {
             if let items = rcListDir(path: path, process: proc) {
                 let enriched: [(String, Bool, Int64)] = items.map { item in
@@ -733,11 +786,9 @@ final class RemoteFileIO: ObservableObject {
                         : ((try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? -1)
                     return (item.name, item.isDir, size)
                 }
-                dbg("  tier3 rc:\(proc) ok: \(enriched.count) entries for \(path)")
                 return (enriched, "rc:\(proc)")
             }
         }
-        dbg("  all tiers failed for \(path)")
 
         return nil  // All tiers failed for this path
     }
@@ -749,52 +800,75 @@ final class RemoteFileIO: ObservableObject {
         let state = pool[process]?.state
         let rc    = pool[process]?.rc
         poolLock.unlock()
-        guard case .ready = state, let rc else { return nil }
+        guard case .ready = state, let rc else {
+            return nil
+        }
 
         let pathBytes = Array((path + "\0").utf8)
         let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return nil }
+        guard trojanMem != 0 else {
+            return nil
+        }
 
         pathBytes.withUnsafeBytes {
             rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count))
         }
 
         let dirPtr = callIn(rc: rc, name: "opendir", args: [trojanMem])
-        guard dirPtr != 0 else { return nil }
-        defer { _ = callIn(rc: rc, name: "closedir", args: [dirPtr]) }
+        guard dirPtr != 0 else {
+            return nil
+        }
+        defer {
+            _ = callIn(rc: rc, name: "closedir", args: [dirPtr])
+        }
 
         // Darwin struct dirent (sys/dirent.h):
         //   offset  0: d_ino      UInt64
         //   offset  8: d_seekoff  UInt64
         //   offset 16: d_reclen   UInt16
         //   offset 18: d_namlen   UInt16
-        //   offset 20: d_type     UInt8  (DT_DIR=4, DT_REG=8, DT_LNK=10)
+        //   offset 20: d_type     UInt8  (DT_DIR=4, DT_REG=8, DT_LNK=10, DT_UNKNOWN=0)
         //   offset 21: d_name     char[]
         let readSize: UInt64 = 21 + 256
         var result: [(name: String, isDir: Bool)] = []
 
         while true {
             let direntPtr = callIn(rc: rc, name: "readdir", args: [dirPtr])
-            guard direntPtr != 0 else { break }
+            guard direntPtr != 0 else {
+                break
+            }
 
             var buf = [UInt8](repeating: 0, count: Int(readSize))
             let ok = buf.withUnsafeMutableBytes { ptr in
                 rc.remoteRead(direntPtr, to: ptr.baseAddress, size: readSize)
             }
-            guard ok else { continue }
+            if !ok {
+                continue
+            }
 
-            let namlen = Int(UInt16(buf[18]) | (UInt16(buf[19]) << 8))
-            let dtype  = buf[20]
-            guard namlen > 0, (21 + namlen) <= buf.count else { continue }
+            let namlen  = Int(UInt16(buf[18]) | (UInt16(buf[19]) << 8))
+            let dtype   = buf[20]
+
+            guard namlen > 0, (21 + namlen) <= buf.count else {
+                continue
+            }
 
             let nameBytes = Array(buf[21..<(21 + namlen)])
-            guard let name = String(bytes: nameBytes, encoding: .utf8),
-                  name != ".", name != ".." else { continue }
+            guard let name = String(bytes: nameBytes, encoding: .utf8) else {
+                continue
+            }
 
-            result.append((name: name, isDir: dtype == 4))
+            if name == "." || name == ".." {
+                continue
+            }
+
+            let isDir = (dtype == 4)
+            result.append((name: name, isDir: isDir))
         }
 
-        guard !result.isEmpty else { return nil }
+        guard !result.isEmpty else {
+            return nil
+        }
         return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -975,30 +1049,79 @@ final class RemoteFileIO: ObservableObject {
     private func rcRead(rc: RemoteCall, path: String, maxSize: Int) -> Data? {
         let pathBytes = Array((path + "\0").utf8)
         let trojanMem = rc.trojanMem
-        guard trojanMem != 0 else { return nil }
+        guard trojanMem != 0 else {
+            return nil
+        }
 
         pathBytes.withUnsafeBytes {
             rc.remote_write(trojanMem, from: $0.baseAddress, size: UInt64(pathBytes.count))
         }
 
         let fd = callIn(rc: rc, name: "open", args: [trojanMem, 0, 0])
-        guard Int32(bitPattern: UInt32(fd & 0xFFFFFFFF)) >= 0 else { return nil }
-        defer { _ = callIn(rc: rc, name: "close", args: [fd]) }
-
-        let remoteBuf = callIn(rc: rc, name: "mmap", args: [
-            0, UInt64(maxSize), 3, 0x1002, UInt64(bitPattern: Int64(-1)), 0
-        ])
-        guard remoteBuf != 0, remoteBuf != UInt64(bitPattern: -1) else { return nil }
-        defer { _ = callIn(rc: rc, name: "munmap", args: [remoteBuf, UInt64(maxSize)]) }
-
-        let n = callIn(rc: rc, name: "read", args: [fd, remoteBuf, UInt64(maxSize)])
-        guard n > 0 else { return nil }
-
-        var local = [UInt8](repeating: 0, count: Int(n))
-        let ok = local.withUnsafeMutableBytes {
-            rc.remoteRead(remoteBuf, to: $0.baseAddress, size: n)
+        let fdSigned = Int32(bitPattern: UInt32(fd & 0xFFFFFFFF))
+        guard fdSigned >= 0 else {
+            return nil
         }
-        return ok ? Data(local) : nil
+        defer {
+            _ = callIn(rc: rc, name: "close", args: [fd])
+        }
+
+        // Seek to beginning — if the fd number was recycled or the remote
+        // process already had this file open, the position could be non-zero.
+        _ = callIn(rc: rc, name: "lseek", args: [fd, 0, 0])  // SEEK_SET=0
+
+        // Use a fixed 1MB remote buffer, cached per RC connection.
+        // CRITICAL: We must NOT munmap+mmap between reads — the kread VA→PA
+        // translation gets stale when the same VA is remapped to different
+        // physical pages, causing remoteRead to return old data.
+        let chunkSize = remoteBufSize
+        let cacheKey = rc.trojanMem
+        remoteBufLock.lock()
+        let cached = remoteBufCache[cacheKey]
+        remoteBufLock.unlock()
+
+        let remoteBuf: UInt64
+        if let c = cached, c != 0, c != UInt64(bitPattern: -1) {
+            remoteBuf = c
+        } else {
+            remoteBuf = callIn(rc: rc, name: "mmap", args: [
+                0, UInt64(chunkSize), 3, 0x1002, UInt64(bitPattern: Int64(-1)), 0
+            ])
+            guard remoteBuf != 0, remoteBuf != UInt64(bitPattern: -1) else {
+                return nil
+            }
+            remoteBufLock.lock()
+            remoteBufCache[cacheKey] = remoteBuf
+            remoteBufLock.unlock()
+        }
+        // NOTE: no munmap in defer — we reuse the same buffer across reads
+
+        // Read loop: read into remote buffer, copy to local, repeat
+        var localData = Data()
+        while localData.count < maxSize {
+            let wantBytes = min(chunkSize, maxSize - localData.count)
+            let n = callIn(rc: rc, name: "read", args: [fd, remoteBuf, UInt64(wantBytes)])
+            let nSigned = Int64(bitPattern: n)
+            if nSigned <= 0 {
+                break
+            }
+
+            var chunkBuf = [UInt8](repeating: 0, count: Int(n))
+            let ok = chunkBuf.withUnsafeMutableBytes {
+                rc.remoteRead(remoteBuf, to: $0.baseAddress, size: n)
+            }
+            if !ok {
+                break
+            }
+
+            localData.append(contentsOf: chunkBuf)
+        }
+
+        guard !localData.isEmpty else {
+            return nil
+        }
+
+        return localData
     }
 
     private func rcWrite(rc: RemoteCall, path: String, data: Data) -> (Bool, Int, String) {

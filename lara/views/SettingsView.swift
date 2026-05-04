@@ -86,24 +86,7 @@ struct SettingsView: View {
                     Text("Lara")
                 }
                 
-                Section {
-                    Picker("", selection: $selectedmethod) {
-                        ForEach(method.allCases, id: \.self) { method in
-                            Text(method.rawValue).tag(method)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                } header: {
-                    Text("Method")
-                } footer: {
-                    if selectedmethod == .vfs {
-                        Text("VFS only.")
-                    } else if selectedmethod == .sbx {
-                        Text("SBX only.")
-                    } else {
-                        Text("Hybrid: SBX for read, VFS for write.\nBest method ever. (Thanks Huy)")
-                    }
-                }
+
                 
                 Section {
                     Toggle("Disable log dividers", isOn: $loggernobullshit)

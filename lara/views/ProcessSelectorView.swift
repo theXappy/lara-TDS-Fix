@@ -11,7 +11,7 @@
 //
 //  Fix log:
 //    • Row layout restructured: buttons moved below the process name to prevent
-//      long names (e.g. mobile_backup_agent2) from being truncated by ellipsis.
+//      long names (e.g. BackupAgent2) from being truncated by ellipsis.
 //      Name + tags on top row, buttons + state on bottom row.
 //
 
@@ -325,7 +325,7 @@ struct ProcessSelectorView: View {
     // MARK: - Unified row (two-line layout: name on top, buttons on bottom)
     //
     // Previous layout had name + tags + buttons all on one HStack line.
-    // Long process names like "mobile_backup_agent2" plus tags ("★", "routed")
+    // Long process names like "BackupAgent2" plus tags ("★", "routed")
     // plus two buttons ("Destroy", "✓ Isolated") overflowed the row width on
     // iPhone screens, causing the name to be truncated by ellipsis.
     //

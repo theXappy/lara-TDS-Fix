@@ -229,7 +229,58 @@ final class laramgr: ObservableObject {
             laramgr.shared.logmsg("(vfs) " + s)
         }
     }
-    
+
+    // MARK: - Public filesystem API (SBX/VFS agnostic)
+
+    func listDirectory(path: String) -> (entries: [(name: String, isDirectory: Bool)], error: String?) {
+        let fm = FileManager.default
+        var isDir = ObjCBool(false)
+        let exists = fm.fileExists(atPath: path, isDirectory: &isDir)
+
+        if exists && isDir.boolValue && fm.isReadableFile(atPath: path) {
+            do {
+                let names = try fm.contentsOfDirectory(atPath: path)
+                let entries = names.map { name -> (String, Bool) in
+                    let full = path == "/" ? "/" + name : path + "/" + name
+                    var d = ObjCBool(false)
+                    fm.fileExists(atPath: full, isDirectory: &d)
+                    return (name, d.boolValue)
+                }.sorted { $0.0.lowercased() < $1.0.lowercased() }
+                return (entries, nil)
+            } catch {
+                // fall through to VFS
+            }
+        }
+
+        if vfsready, let items = vfslistdir(path: path) {
+            let mapped = items.map { (name: $0.name, isDirectory: $0.isDir) }
+            return (mapped, nil)
+        }
+
+        return ([], "Cannot list directory.")
+    }
+
+    func readFile(path: String, maxSize: Int = 512 * 1024) -> Data? {
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count <= maxSize {
+            return data
+        }
+        return vfsread(path: path, maxSize: maxSize)
+    }
+
+    func writeFile(path: String, data: Data) -> Bool {
+        let (ok, _) = sbxoverwrite(path: path, data: data)
+        if ok { return true }
+        return vfswrite(path: path, data: data)
+    }
+
+    func fileSize(path: String) -> Int64 {
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+           let size = attrs[.size] as? Int64 {
+            return size
+        }
+        return vfssize(path: path)
+    }
+
     func vfslistdir(path: String) -> [(name: String, isDir: Bool)]? {
         guard vfsready else {
             logmsg(" listdir: not ready (\(path))")
